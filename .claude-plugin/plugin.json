@@ -1,0 +1,15 @@
+{
+  "name": "herdr-orchestrator",
+  "description": "Orchestrate multiple coding agents across separate issues using Herdr, with worktree-isolated workers and a persistent board that survives context clears",
+  "version": "0.1.0",
+  "author": {
+    "name": "maulik13"
+  },
+  "homepage": "https://github.com/maulik13/herdr-orchestrator",
+  "keywords": [
+    "herdr",
+    "orchestration",
+    "multi-agent",
+    "worktree"
+  ]
+}

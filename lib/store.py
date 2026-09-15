@@ -1,0 +1,854 @@
+"""State store for the herdr orchestrator.
+
+state.json is the source of truth. board.md is regenerated from it on every
+write, so a resuming orchestrator can `cat` one file and a human can read the
+same thing in git. Both the `orch` CLI and the webapp go through this module,
+which is what keeps concurrent writes from the two of them safe: every
+read-modify-write happens inside an flock on a sibling .lock file.
+"""
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
+SCHEMA_VERSION = 2
+
+# Phases an agent is actively holding a slot for. `pr-open` is deliberately
+# excluded: a PR can sit for days waiting on human review, and blocking the
+# queue on that would starve everything behind it.
+ACTIVE_PHASES = [
+    "planning",
+    "awaiting-plan",
+    "implementing",
+    "needs-review",
+    "reviewing",
+    "resolving",
+    "awaiting-decision",
+]
+
+PHASES = ["queued"] + ACTIVE_PHASES + [
+    "pr-open",
+    "merged",
+    "archived",
+    "blocked",
+    "parked",
+]
+
+TERMINAL_PHASES = ["archived"]
+
+# Board sections, in display order. The phase order INSIDE each tuple is also
+# the sort order within that section — implementing reads before planning, and
+# open PRs sort last in review because they are yours to merge rather than an
+# agent's to finish.
+SECTIONS = [
+    ("in progress", ["implementing", "planning", "awaiting-plan"]),
+    ("review",      ["needs-review", "reviewing", "resolving", "awaiting-decision",
+                     "pr-open", "merged"]),
+    ("queued",      ["queued"]),
+    ("parked",      ["parked", "blocked"]),
+    ("done",        ["archived"]),
+]
+
+# Sections that start shut. Their header summary is what keeps them useful
+# closed, so nothing here is hidden — only folded.
+COLLAPSED_BY_DEFAULT = ["parked", "done"]
+
+# Phases that are the human's move rather than an agent's, surfaced in a
+# section header so a shut section still says what it is waiting on.
+YOURS_PHASES = ["awaiting-plan", "awaiting-decision", "pr-open"]
+
+
+def section_of(phase):
+    for name, phases in SECTIONS:
+        if phase in phases:
+            return name
+    return None
+
+
+def sort_key(t):
+    """Position within a section: declared phase order, then queue order."""
+    for _, phases in SECTIONS:
+        if t["phase"] in phases:
+            return (phases.index(t["phase"]), t.get("order", 0))
+    return (99, t.get("order", 0))
+
+
+SEVERITIES = ["P1", "P2", "P3"]
+BLOCKING = ["P1", "P2"]          # P3 is advisory and never blocks a PR
+
+APPROVAL_KINDS = ["plan", "breaking-change", "conflict", "question"]
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def orch_home():
+    return os.environ.get(
+        "HERDR_ORCHESTRATOR_HOME", os.path.join(os.path.expanduser("~"), ".claude", "orchestrator")
+    )
+
+
+def repo_root(cwd=None):
+    """Main repo root, resolved so it is stable from inside a linked worktree."""
+    cwd = cwd or os.getcwd()
+    try:
+        out = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        return os.path.dirname(out)
+    except Exception:
+        return None
+
+
+def slug_for(root):
+    h = hashlib.sha1(root.encode()).hexdigest()[:6]
+    return "%s-%s" % (os.path.basename(root), h)
+
+
+def board_dir():
+    """The single board. Work spans repos, so state is not scoped to one."""
+    return orch_home()
+
+
+def resolve_repo(path):
+    """Absolute main-repo root for a path, or raise if it is not a git repo."""
+    p = os.path.abspath(os.path.expanduser(path))
+    r = subprocess.run(
+        ["git", "-C", p, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        raise ValueError("%s is not a git repository" % p)
+    return os.path.dirname(r.stdout.strip())
+
+
+PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+def add_project(state, name, path):
+    if not PROJECT_RE.match(name):
+        raise ValueError("project name %r must match [a-z0-9][a-z0-9_-]{0,31}" % name)
+    root = resolve_repo(path)
+    for p in state.setdefault("projects", []):
+        if p["name"] == name:
+            raise ValueError("project %r already registered at %s" % (name, p["path"]))
+        if p["path"] == root:
+            raise ValueError("%s is already registered as %r" % (root, p["name"]))
+    rec = {"name": name, "path": root, "added": now()}
+    state["projects"].append(rec)
+    log(state, "registered project %s -> %s" % (name, root))
+    return rec
+
+
+def update_project(state, name, new_name=None, new_path=None):
+    """Rename a project and/or point it at a different repo.
+
+    Tasks, approvals and suggestions reference a project by name, so a rename
+    has to cascade to all of them in the same transaction — a half-applied
+    rename would orphan every task in the project.
+    """
+    proj = find_project(state, name)
+    if not proj:
+        raise KeyError("no project %r" % name)
+
+    changes = []
+
+    if new_path:
+        root = resolve_repo(new_path)
+        clash = next((p for p in state["projects"]
+                      if p["path"] == root and p["name"] != name), None)
+        if clash:
+            raise ValueError("%s is already registered as %r" % (root, clash["name"]))
+        if root != proj["path"]:
+            changes.append("path %s -> %s" % (proj["path"], root))
+            proj["path"] = root
+
+    if new_name and new_name != name:
+        if not PROJECT_RE.match(new_name):
+            raise ValueError("project name %r must match [a-z0-9][a-z0-9_-]{0,31}" % new_name)
+        if find_project(state, new_name):
+            raise ValueError("project %r already exists" % new_name)
+        n = 0
+        for coll in ("tasks", "approvals", "suggestions"):
+            for row in state.get(coll, []):
+                if row.get("project") == name:
+                    row["project"] = new_name
+                    n += 1
+        proj["name"] = new_name
+        changes.append("name %s -> %s (%d reference%s updated)"
+                       % (name, new_name, n, "" if n == 1 else "s"))
+
+    if not changes:
+        raise ValueError("nothing to change")
+    proj["updated"] = now()
+    log(state, "project %s: %s" % (name, "; ".join(changes)))
+    return proj
+
+
+def remove_project(state, name):
+    held = [t["key"] for t in state["tasks"]
+            if t.get("project") == name and t["phase"] not in TERMINAL_PHASES]
+    if held:
+        raise ValueError("project %r still has live tasks: %s" % (name, ", ".join(held)))
+    before = len(state.get("projects", []))
+    state["projects"] = [p for p in state.get("projects", []) if p["name"] != name]
+    if len(state["projects"]) == before:
+        raise KeyError("no project %r" % name)
+    log(state, "removed project %s" % name)
+
+
+def find_project(state, name):
+    for p in state.get("projects", []):
+        if p["name"] == name:
+            return p
+    return None
+
+
+def project_for_cwd(state, cwd=None):
+    """Which registered project contains this directory, if any.
+
+    Lets a worker or the orchestrator infer the project from where it is
+    standing, while leaving the creator free to name one explicitly.
+    """
+    try:
+        root = resolve_repo(cwd or os.getcwd())
+    except Exception:
+        return None
+    for p in state.get("projects", []):
+        if p["path"] == root:
+            return p
+    return None
+
+
+def worker_name(key, taken=()):
+    """Sanitise an issue key into a herdr agent name: [a-z][a-z0-9_-]{0,31}."""
+    n = re.sub(r"[^a-z0-9]+", "-", key.lower()).strip("-")[:32]
+    if not n or not n[0].isalpha():
+        n = ("t-" + n)[:32]
+    base, i = n, 2
+    while n in taken:
+        suffix = "-%d" % i
+        n = base[: 32 - len(suffix)] + suffix
+        i += 1
+    return n
+
+
+@contextmanager
+def locked(pdir):
+    os.makedirs(pdir, exist_ok=True)
+    lock_path = os.path.join(pdir, ".lock")
+    with open(lock_path, "w") as fh:
+        # Blocking flock: the webapp and the orchestrator can both be mid-write,
+        # and the loser should wait rather than clobber.
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _blank():
+    return {
+        "schema": SCHEMA_VERSION,
+        "max_active": 3,
+        "updated": now(),
+        "projects": [],
+        "tasks": [],
+        "suggestions": [],
+        "findings": [],
+        "approvals": [],
+        "log": [],
+    }
+
+
+def _path(pdir):
+    return os.path.join(pdir, "state.json")
+
+
+def read(pdir):
+    p = _path(pdir)
+    if not os.path.exists(p):
+        return _blank()
+    with open(p) as fh:
+        st = json.load(fh)
+    if st.get("schema", 1) != SCHEMA_VERSION:
+        raise ValueError("board at %s uses schema v%s; this build expects v%s"
+                         % (p, st.get("schema", 1), SCHEMA_VERSION))
+    return st
+
+
+def write(pdir, state):
+    state["updated"] = now()
+    state["log"] = state.get("log", [])[-40:]
+    os.makedirs(pdir, exist_ok=True)
+    tmp = _path(pdir) + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, _path(pdir))
+    render_board(pdir, state)
+    return state
+
+
+@contextmanager
+def transaction(pdir):
+    """Read-modify-write under lock. Yields the state dict; mutate it in place."""
+    with locked(pdir):
+        state = read(pdir)
+        yield state
+        write(pdir, state)
+
+
+def log(state, msg):
+    state.setdefault("log", []).append("%s %s" % (now(), msg))
+
+
+def find(state, tid, project=None):
+    """Resolve by id, worker name, key, or project/key.
+
+    Ids and worker names are globally unique. Keys are not — two repos can both
+    have a DOC-1 — so an ambiguous key raises instead of guessing which repo
+    the caller meant.
+    """
+    if tid and "/" in tid:
+        project, tid = tid.split("/", 1)
+    for t in state["tasks"]:
+        if t["id"] == tid or t.get("worker") == tid:
+            return t
+    hits = [t for t in state["tasks"]
+            if t.get("key") == tid and (project is None or t.get("project") == project)]
+    if len(hits) > 1:
+        raise ValueError("%r is ambiguous across projects (%s); qualify it as <project>/%s"
+                         % (tid, ", ".join(sorted(t.get("project") or "?" for t in hits)), tid))
+    return hits[0] if hits else None
+
+
+def active_tasks(state):
+    return [t for t in state["tasks"] if t["phase"] in ACTIVE_PHASES]
+
+
+def next_queued(state):
+    q = sorted(
+        [t for t in state["tasks"] if t["phase"] == "queued"],
+        key=lambda t: t.get("order", 0),
+    )
+    return q[0] if q else None
+
+
+def can_start(state):
+    return len(active_tasks(state)) < int(state.get("max_active", 3))
+
+
+def add_task(state, key, title, source="manual", url=None, done_when=None,
+             kind="claude", project=None):
+    if not find_project(state, project):
+        known = ", ".join(p["name"] for p in state.get("projects", [])) or "none registered"
+        raise ValueError("unknown project %r (known: %s). Register it with "
+                         "`orch project add <name> --path <repo>`." % (project, known))
+    taken = {t.get("worker") for t in state["tasks"] if t.get("worker")}
+    orders = [t.get("order", 0) for t in state["tasks"]] or [0]
+    task = {
+        "id": "t%d" % (int(time.time() * 1000) % 100000000),
+        "key": key,
+        "project": project,
+        "title": title,
+        "source": source,
+        "url": url,
+        "done_when": done_when,
+        "kind": kind,
+        "phase": "queued",
+        "order": max(orders) + 1,
+        "worker": worker_name(key, taken),
+        "reviewer": None,
+        "workspace": None,
+        "pane": None,
+        "worktree": None,
+        "branch": None,
+        "pr_url": None,
+        "pr_state": None,
+        "review_round": 0,
+        "trivial": False,
+        "note": None,
+        "created": now(),
+        "updated": now(),
+    }
+    state["tasks"].append(task)
+    log(state, "added %s/%s (%s)" % (project, key, task["worker"]))
+    return task
+
+
+# Fields an existing task may be edited through. The first row is intake
+# metadata — what the issue is and where it came from. It is editable because
+# intake is not always right the first time: a task adopted mid-flight starts
+# with an empty done_when, and a mis-scoped one has to be correctable against
+# its own definition of done. Without this the only route was delete-and-
+# recreate, which costs the task its queue position and its id.
+#
+# `key` and `project` are deliberately absent. Both are referential: `worker`
+# is derived from `key` when the task is created, `find` resolves and
+# disambiguates by `key`, and `project` names the repo a worktree was cut from.
+# Rewriting either on a live task orphans real artifacts.
+EDITABLE_FIELDS = (
+    "title", "url", "source", "done_when",
+    "branch", "workspace", "pane", "worktree", "pr_url", "pr_state",
+    "reviewer", "note", "review_round", "trivial",
+)
+
+# Fields that must survive as a non-empty string. `render_board` slices
+# `title` unconditionally, so anything else there — None, a number, a list —
+# is not a cosmetic problem: it is written to state.json before the board is
+# rendered, so the board becomes permanently un-renderable and every later
+# `orch` write raises on its way out while still landing the write.
+REQUIRED_FIELDS = ("title",)
+
+# Fields stored as a count. `review_round` is read by the `pr-open` gate, and a
+# gate that tests truthiness cannot be handed a string: "0" is truthy, so an
+# unreviewed task walked straight through. Coerced on the way in so the value
+# on disk is the type the gate expects.
+INT_FIELDS = ("review_round",)
+
+
+def as_count(field, v):
+    """Parse a whole number, zero or more. Raises ValueError on anything else.
+
+    Deliberately strict: `int(3.7)` would silently truncate, and `int(True)` is
+    1, neither of which anyone meant to write into a review count.
+    """
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        raise ValueError("%s must be a whole number, got %r" % (field, v))
+    if n < 0:
+        raise ValueError("%s must be zero or more, got %r" % (field, v))
+    return n
+
+
+def review_rounds(t):
+    """How many review rounds a task has recorded, as an int.
+
+    Tolerant of boards written before `review_round` was coerced: values are
+    already on disk as strings, there is no migration, and this is a safety
+    gate, so it reads defensively and fails closed — anything unparseable
+    counts as zero rounds, which blocks rather than opens.
+    """
+    try:
+        return as_count("review_round", t.get("review_round") or 0)
+    except ValueError:
+        return 0
+
+
+def update_task(state, tid, updates):
+    """Apply field edits to an existing task.
+
+    An empty string clears a field to None — that is the only way to unset one,
+    and a cleared field reads exactly like one never supplied at intake.
+    Fields in REQUIRED_FIELDS cannot be cleared, and are checked by type rather
+    than by emptiness: the CLI can only hand this function strings, but the
+    webapp is invited to call it too, and JSON has more ways to say "blank".
+    """
+    t = find(state, tid)
+    if not t:
+        raise KeyError("no task %r" % tid)
+    if not updates:
+        raise ValueError("nothing to set")
+
+    clean = {}
+    for k, v in updates.items():
+        if k not in EDITABLE_FIELDS:
+            raise ValueError("%r is not an editable field; expected one of %s"
+                             % (k, ", ".join(sorted(EDITABLE_FIELDS))))
+        if isinstance(v, str):
+            v = v.strip() or None
+        if k in REQUIRED_FIELDS and not isinstance(v, str):
+            raise ValueError("%s must be a non-empty string, got %r — a task with no "
+                             "readable %s is a blank row on the board" % (k, v, k))
+        if k in INT_FIELDS and v is not None:
+            v = as_count(k, v)
+        clean[k] = v
+
+    t.update(clean)
+    t["updated"] = now()
+    log(state, "%s set %s" % (t["key"], ", ".join(sorted(clean))))
+    return t
+
+
+def set_phase(state, tid, phase, note=None, force=False):
+    if phase not in PHASES:
+        raise ValueError("unknown phase %r; expected one of %s" % (phase, ", ".join(PHASES)))
+    t = find(state, tid)
+    if not t:
+        raise KeyError("no task %r" % tid)
+
+    # Opening a PR is the point of no return for unreviewed code, so the review
+    # gate is enforced here rather than left to an agent remembering a brief.
+    # Two sanctioned escapes: the task was marked trivial at intake, or a human
+    # passed --force. Both are recorded; silently skipping review is not.
+    if phase == "pr-open" and not force and not t.get("trivial"):
+        if not review_rounds(t):
+            raise ValueError(
+                "%s has had no review round and is not marked trivial. "
+                "Run the reviewer, or `orch set %s --trivial` if this genuinely does "
+                "not need one, or `orch phase %s pr-open --force` to override."
+                % (t["key"], t["key"], t["key"]))
+        # A round having happened is not the same as its findings being dealt
+        # with, which is what REVIEW.md could never answer mechanically.
+        blockers = blocking_open(state, t["id"])
+        if blockers:
+            raise ValueError(
+                "%s has %d unresolved blocking finding(s): %s. Resolve or dispute "
+                "each with `orch finding resolve|dispute <id> --note ...`, or "
+                "`orch phase %s pr-open --force` to override."
+                % (t["key"], len(blockers),
+                   ", ".join("%s %s" % (f["id"], f["severity"]) for f in blockers),
+                   t["key"]))
+
+    old = t["phase"]
+    t["phase"] = phase
+    t["updated"] = now()
+    if note:
+        t["note"] = note
+    log(state, "%s %s -> %s%s" % (t["key"], old, phase, (": " + note) if note else ""))
+    return t
+
+
+def _norm(t):
+    return re.sub(r"[^a-z0-9]+", " ", (t or "").lower()).strip()
+
+
+def add_finding(state, tid, severity, title, detail="", where=None, source=None):
+    """Record one review finding against a task.
+
+    Findings are board state, not a file in the worktree. A REVIEW.md dies with
+    the worktree it was written in, is invisible to the human until someone
+    opens a pane, and cannot be checked mechanically — so "are P1 and P2
+    resolved?" ends up being answered by an agent reading its own prose.
+    """
+    if severity not in SEVERITIES:
+        raise ValueError("severity must be one of %s" % ", ".join(SEVERITIES))
+    t = find(state, tid)
+    if not t:
+        raise KeyError("no task %r" % tid)
+    f = {
+        "id": "f%d" % (int(time.time() * 1000) % 100000000),
+        "task": t["id"],
+        "key": t["key"],
+        "project": t.get("project"),
+        "round": t.get("review_round") or 1,
+        "severity": severity,
+        "title": title,
+        "detail": detail,
+        "where": where,
+        "status": "open",
+        "source": source,
+        "response": None,
+        "created": now(),
+        "updated": now(),
+    }
+    state.setdefault("findings", []).append(f)
+    log(state, "%s finding %s %s: %s" % (t["key"], f["id"], severity, title))
+    return f
+
+
+def findings_for(state, tid, open_only=False, blocking_only=False):
+    t = find(state, tid)
+    if not t:
+        raise KeyError("no task %r" % tid)
+    out = [f for f in state.get("findings", []) if f["task"] == t["id"]]
+    if open_only:
+        out = [f for f in out if f["status"] in ("open", "disputed")]
+    if blocking_only:
+        out = [f for f in out if f["severity"] in BLOCKING]
+    return sorted(out, key=lambda f: (SEVERITIES.index(f["severity"]), f["created"]))
+
+
+def blocking_open(state, tid):
+    """Open P1/P2 findings — what stands between a task and a PR."""
+    return [f for f in findings_for(state, tid, open_only=True, blocking_only=True)]
+
+
+def set_finding(state, fid, status, response=None):
+    if status not in ("open", "resolved", "disputed", "accepted"):
+        raise ValueError("unknown finding status %r" % status)
+    for f in state.get("findings", []):
+        if f["id"] == fid:
+            f["status"] = status
+            f["response"] = response or f.get("response")
+            f["updated"] = now()
+            log(state, "%s finding %s -> %s" % (f["key"], fid, status))
+            return f
+    raise KeyError("no finding %r" % fid)
+
+
+def add_suggestion(state, title, evidence, body="", source=None, project=None):
+    """File an improvement suggestion.
+
+    Suggestions are deliberately NOT tasks. They never consume a WIP slot and
+    are never dispatched; a human promotes one into real work or dismisses it.
+    That gap is what stops the system from rewriting itself unsupervised.
+
+    Re-filing something already open does not create a duplicate — it seconds
+    the existing one and appends the new evidence. The same papercut hit by
+    three workers should read as one high-priority item, not three rows.
+    """
+    if not evidence or not evidence.strip():
+        raise ValueError("a suggestion needs --evidence: what actually happened, "
+                         "in this task, that cost time or produced a wrong result")
+    for x in state.setdefault("suggestions", []):
+        if x["status"] == "open" and _norm(x["title"]) == _norm(title):
+            x["seconded"] = x.get("seconded", 0) + 1
+            x.setdefault("evidence", [])
+            if evidence not in x["evidence"]:
+                x["evidence"].append("%s (%s)" % (evidence, source or "?"))
+            x["updated"] = now()
+            log(state, "seconded suggestion %s (%dx): %s" % (x["id"], x["seconded"] + 1, x["title"]))
+            return x
+
+    sug = {
+        "id": "s%d" % (int(time.time() * 1000) % 100000000),
+        "title": title,
+        "body": body,
+        "evidence": ["%s (%s)" % (evidence, source or "?")],
+        "project": project,          # None == about the orchestrator tooling itself
+        "source": source,
+        "status": "open",
+        "seconded": 0,
+        "promoted_to": None,
+        "created": now(),
+        "updated": now(),
+    }
+    state["suggestions"].append(sug)
+    log(state, "suggested: %s" % title)
+    return sug
+
+
+def open_suggestions(state):
+    return [x for x in state.get("suggestions", []) if x["status"] == "open"]
+
+
+def find_suggestion(state, sid):
+    for x in state.get("suggestions", []):
+        if x["id"] == sid:
+            return x
+    raise KeyError("no suggestion %r" % sid)
+
+
+def promote_suggestion(state, sid, key, project=None, trivial=False):
+    """Turn a suggestion into a real queued task. Human-initiated only."""
+    sug = find_suggestion(state, sid)
+    if sug["status"] != "open":
+        raise ValueError("suggestion %s is already %s" % (sid, sug["status"]))
+    project = project or sug.get("project")
+    body = sug.get("body") or ""
+    ev = "\n".join("- %s" % e for e in sug.get("evidence", []))
+    t = add_task(state, key, sug["title"], source="suggestion", project=project,
+                 done_when=body or None)
+    t["trivial"] = trivial
+    t["note"] = ("promoted from %s\nevidence:\n%s" % (sid, ev)).strip()
+    sug["status"] = "promoted"
+    sug["promoted_to"] = t["id"]
+    sug["updated"] = now()
+    log(state, "promoted %s -> %s/%s" % (sid, project, key))
+    return t
+
+
+def dismiss_suggestion(state, sid, reason=None):
+    sug = find_suggestion(state, sid)
+    if sug["status"] != "open":
+        raise ValueError("suggestion %s is already %s" % (sid, sug["status"]))
+    sug["status"] = "dismissed"
+    sug["reason"] = reason
+    sug["updated"] = now()
+    log(state, "dismissed %s%s" % (sid, (": " + reason) if reason else ""))
+    return sug
+
+
+def delete_task(state, tid, force=False):
+    """Remove a task and its approval cards.
+
+    Refused while the task still owns real artifacts — a herdr workspace, a
+    worktree or an open PR — because deleting the record does not delete those,
+    it just means nothing is tracking them any more. An archived task has
+    already been through cleanup, so its record is safe to drop.
+    """
+    t = find(state, tid)
+    if not t:
+        raise KeyError("no task %r" % tid)
+    if not force and t["phase"] not in TERMINAL_PHASES:
+        held = [lbl for lbl, v in (("workspace", t.get("workspace")),
+                                   ("worktree", t.get("worktree")),
+                                   ("PR", t.get("pr_url"))) if v]
+        if held:
+            raise ValueError(
+                "%s still owns %s — deleting the task would orphan %s. Clean up first "
+                "(`orch cleanup-check %s`), or pass --force to drop the record anyway."
+                % (t["key"], ", ".join(held), "them" if len(held) > 1 else "it", t["key"]))
+    state["tasks"] = [x for x in state["tasks"] if x["id"] != t["id"]]
+    state["approvals"] = [a for a in state.get("approvals", []) if a["task"] != t["id"]]
+    log(state, "deleted %s/%s" % (t.get("project"), t["key"]))
+    return t
+
+
+def deletable(t):
+    """Whether delete_task would accept this task without --force."""
+    if t["phase"] in TERMINAL_PHASES:
+        return True
+    return not (t.get("workspace") or t.get("worktree") or t.get("pr_url"))
+
+
+def reorder(state, ordered_ids):
+    """Apply a new queue order. Ids not mentioned keep their relative position after."""
+    pos = {tid: i for i, tid in enumerate(ordered_ids)}
+    for t in state["tasks"]:
+        if t["id"] in pos:
+            t["order"] = pos[t["id"]]
+    log(state, "queue reordered")
+
+
+def add_approval(state, tid, kind, title, body="", plan_path=None):
+    if kind not in APPROVAL_KINDS:
+        raise ValueError("unknown approval kind %r" % kind)
+    t = find(state, tid)
+    if not t:
+        raise KeyError("no task %r" % tid)
+    a = {
+        "id": "a%d" % (int(time.time() * 1000) % 100000000),
+        "task": t["id"],
+        "key": t["key"],
+        "project": t.get("project"),
+        "kind": kind,
+        "title": title,
+        "body": body,
+        "status": "pending",
+        "plan_path": plan_path,   # a document Plannotator can open for review
+        "review_started": None,   # set while a Plannotator gate is open
+        "created": now(),
+        "resolved": None,
+        "decision_note": None,
+    }
+    state.setdefault("approvals", []).append(a)
+    log(state, "%s awaiting %s approval" % (t["key"], kind))
+    return a
+
+
+def resolve_approval(state, aid, decision, note=None):
+    for a in state.get("approvals", []):
+        if a["id"] == aid and a["status"] == "pending":
+            a["status"] = decision
+            a["resolved"] = now()
+            a["decision_note"] = note
+            log(state, "%s %s %s" % (a["key"], a["kind"], decision))
+            return a
+    raise KeyError("no pending approval %r" % aid)
+
+
+def pending_approvals(state, tid=None):
+    out = [a for a in state.get("approvals", []) if a["status"] == "pending"]
+    if tid:
+        t = find(state, tid)
+        out = [a for a in out if t and a["task"] == t["id"]]
+    return out
+
+
+def task_repo(state, t):
+    """Main repo root for a task, from its registered project."""
+    p = find_project(state, t.get("project"))
+    return p["path"] if p else None
+
+
+def resumable(state):
+    """Tasks stopped on a human decision that has since been made.
+
+    A worker that submits a plan and stops is idle: it will not spontaneously
+    poll for the answer. Something has to wake it, so the orchestrator watches
+    this list and prompts the worker with the decision.
+    """
+    out = []
+    for t in state["tasks"]:
+        if t["phase"] not in ("awaiting-plan", "awaiting-decision"):
+            continue
+        mine = [a for a in state.get("approvals", []) if a["task"] == t["id"]]
+        if not mine or any(a["status"] == "pending" for a in mine):
+            continue
+        latest = sorted(mine, key=lambda a: a.get("resolved") or "")[-1]
+        out.append((t, latest))
+    return out
+
+
+def render_board(pdir, state):
+    """Regenerate board.md. Human/git-readable view; never parsed back."""
+    L = []
+    L.append("# Orchestrator board")
+    L.append("Updated: %s" % state.get("updated", ""))
+    L.append("Max active: %s  (active now: %d)" % (state.get("max_active", 3), len(active_tasks(state))))
+    L.append("")
+    L.append("_Generated from state.json — edit via the `orch` CLI or the webapp, not by hand._")
+    L.append("")
+
+    L.append("## Projects")
+    if state.get("projects"):
+        L.append("| Name | Path | Open tasks |")
+        L.append("|---|---|---|")
+        for p in sorted(state["projects"], key=lambda p: p["name"]):
+            n = len([t for t in state["tasks"]
+                     if t.get("project") == p["name"] and t["phase"] not in TERMINAL_PHASES])
+            L.append("| %s | `%s` | %d |" % (p["name"], p["path"], n))
+    else:
+        L.append("_none registered — `orch project add <name> --path <repo>`_")
+    L.append("")
+
+    pend = pending_approvals(state)
+    L.append("## Awaiting you")
+    if pend:
+        L.append("| Project | Key | Kind | What | Since |")
+        L.append("|---|---|---|---|---|")
+        for a in pend:
+            L.append("| %s | %s | %s | %s | %s |" % (
+                a.get("project") or "-", a["key"], a["kind"], a["title"], a["created"][11:16]))
+    else:
+        L.append("_nothing pending_")
+    L.append("")
+
+    for col, phases in SECTIONS:
+        rows = [t for t in state["tasks"] if t["phase"] in phases]
+        rows.sort(key=sort_key)
+        L.append("## %s" % col)
+        if not rows:
+            L.append("_empty_")
+            L.append("")
+            continue
+        L.append("| Project | Key | Title | Phase | Worker | Branch | PR |")
+        L.append("|---|---|---|---|---|---|---|")
+        for t in rows:
+            pr = "[%s](%s)" % (t.get("pr_state") or "open", t["pr_url"]) if t.get("pr_url") else "-"
+            flag = " _(trivial)_" if t.get("trivial") else ""
+            L.append("| %s | %s | %s%s | %s | %s | %s | %s |" % (
+                t.get("project") or "-", t["key"], t["title"][:44], flag, t["phase"],
+                t.get("worker") or "-", t.get("branch") or "-", pr))
+        L.append("")
+
+    sugs = sorted(open_suggestions(state), key=lambda x: -x.get("seconded", 0))
+    L.append("## Suggestions")
+    if sugs:
+        L.append("| id | Hit | Project | Suggestion |")
+        L.append("|---|---|---|---|")
+        for x in sugs:
+            L.append("| %s | %dx | %s | %s |" % (
+                x["id"], x.get("seconded", 0) + 1, x.get("project") or "tooling", x["title"]))
+    else:
+        L.append("_none open_")
+    L.append("")
+
+    L.append("## Log")
+    for line in state.get("log", [])[-40:]:
+        L.append("- %s" % line)
+    L.append("")
+
+    with open(os.path.join(pdir, "board.md"), "w") as fh:
+        fh.write("\n".join(L))

@@ -1,0 +1,359 @@
+/* Rosé Pine — https://rosepinetheme.com
+   Roles taken from the canonical rose-pine/palette repo, not eyeballed:
+     Dawn  base #faf4ed surface #fffaf3 overlay #f2e9e1 muted #9893a5
+           subtle #797593 text #464261
+           love #b4637a gold #ea9d34 rose #d7827e pine #286983
+           foam #56949f iris #907aa9
+     Moon  base #232136 surface #2a273f overlay #393552 muted #6e6a86
+           subtle #908caa text #e0def4
+           love #eb6f92 gold #f6c177 rose #ea9a97 pine #3e8fb0
+           foam #9ccfd8 iris #c4a7e7
+
+   Three surface levels carry the depth, and the ordering flips between
+   variants because "raised" means different things: in Moon a raised panel is
+   lighter than the page, in Dawn the lane is a faintly darker tray holding
+   cards that are the whitest thing on screen.
+
+   Unlike Gotham, every Rosé Pine accent is legible as text on its own base, so
+   phase tags go back to iris rather than borrowing the warning colour. */
+:root {
+  color-scheme: light;
+  --bg:      #faf4ed;  /* base    page                */
+  --surface: #f2e9e1;  /* overlay lane tray           */
+  --card:    #fffaf3;  /* surface card (raised)       */
+  --line:    #dfdad9;
+  --edge:    #cecacd;
+  --dim:     #797593;  /* subtle  secondary text      */
+  --ink:     #464261;  /* text                        */
+  --bright:  #575279;
+
+  --accent:  #286983;  /* pine  — implementing lane, primary actions */
+  --ok:      #56949f;  /* foam  — PR lane                            */
+  --warn:    #ea9d34;  /* gold  — approvals, trivial marker          */
+  --danger:  #b4637a;  /* love  — delete                             */
+  --busy:    #907aa9;  /* iris  — column titles, phase tags, rules   */
+  --rose:    #d7827e;  /* rose  — the implementing lane               */
+  /* Dawn's iris and rose are mid-tone pastels: as title text on a near-white
+     panel they land near 2.4:1. Darkened toward `text` for legibility, which
+     keeps the hue while clearing AA. Fills below still use the true colours. */
+  --title:        color-mix(in srgb, #907aa9 34%, #464261);
+  --title-active: color-mix(in srgb, #d7827e 30%, #464261);
+
+  --on-accent: #fffaf3;
+  --warn-bg: color-mix(in srgb, var(--warn) 14%, var(--card));
+  --shadow: 0 1px 2px rgba(70,66,97,.10), 0 6px 18px rgba(70,66,97,.10);
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --radius: 3px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg:      #232136;  /* base                     */
+    --surface: #2a273f;  /* surface  lane panel      */
+    --card:    #393552;  /* overlay  card (raised)   */
+    --line:    #44415a;
+    --edge:    #56526e;
+    --dim:     #908caa;  /* subtle                   */
+    --ink:     #e0def4;  /* text                     */
+    --bright:  #ffffff;
+
+    --accent:  #9ccfd8;  /* foam */
+    --ok:      #3e8fb0;  /* pine */
+    --warn:    #f6c177;  /* gold */
+    --danger:  #eb6f92;  /* love */
+    --busy:    #c4a7e7;  /* iris */
+    --rose:    #ea9a97;  /* rose */
+    /* Moon's are light enough on a dark base to use straight. */
+    --title:        #c4a7e7;
+    --title-active: #ea9a97;
+
+    --on-accent: #232136;
+    --shadow: 0 1px 2px rgba(0,0,0,.40), 0 8px 24px rgba(0,0,0,.35);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto; max-width: 1720px;
+  padding: 16px 20px 40px; background: var(--bg); color: var(--ink);
+  font: 13px/1.5 var(--mono);
+  -webkit-font-smoothing: antialiased;
+}
+header {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding-bottom: 14px; margin-bottom: 34px;
+  border-bottom: 1px solid var(--line);
+}
+h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+h1::before { content: "❯ "; color: var(--ok); font-weight: 400; }
+h2 { font-size: 12px; letter-spacing: .06em; color: var(--dim); margin: 0 0 10px;
+  text-transform: lowercase; font-weight: 600; }
+/* Counts read as a shell-ish token rather than a stray number. */
+.meta { display: flex; align-items: center; gap: 12px; margin-left: auto; }
+.dim { color: var(--dim); font-size: 12px; }
+.cap { color: var(--dim); font-size: 12px; }
+.cap input { width: 46px; padding: 2px 4px; background: var(--bg); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--radius); font: inherit; }
+.pill { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 2px 10px; font-size: 12px; }
+.pill.full { border-color: var(--warn); color: var(--warn); }
+
+#approvals-wrap { margin-bottom: 26px; }
+.approval { background: var(--warn-bg); border: 1px solid var(--warn); border-radius: var(--radius);
+  padding: 10px 12px; margin-bottom: 8px; }
+.approval .k { font-weight: 600; }
+.approval pre { white-space: pre-wrap; font: 12px/1.5 ui-monospace, monospace;
+  margin: 6px 0 8px; color: var(--ink);
+  /* A worker can write a long plan into the body. Uncapped, one approval
+     pushes the whole board below the fold — scroll it instead. */
+  max-height: 210px; overflow: auto;
+  border-left: 2px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  padding-left: 10px; }
+.approval .btns { display: flex; gap: 8px; }
+
+/* Freeform feedback on a decision. Auto-grown from JS rather than user-resized:
+   the height is rewritten on every keystroke, so a manual drag would not stick.
+   Capped in CSS instead — a long note scrolls rather than burying the board. */
+.approval .note { display: block; box-sizing: border-box; width: 100%;
+  font: 12px/1.5 var(--mono); resize: none; overflow-y: auto;
+  min-height: 56px; max-height: 260px; margin: 0 0 8px; padding: 7px 9px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--bg); color: var(--ink); }
+.approval .note::placeholder { color: var(--dim); }
+.approval .note:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+.approval .notehint { font-size: 11px; color: var(--warn); margin: -4px 0 8px; }
+
+/* A note whose approval was settled elsewhere mid-composition. Reads as spent
+   rather than actionable — no warning fill, no primary button — but the text
+   stays selectable so it can be copied out before the card is dismissed. */
+.approval.orphan { background: var(--card); border-color: var(--edge); border-style: dashed; }
+.approval.orphan .orphanwhy { font-size: 11px; color: var(--dim); margin: 4px 0 6px; }
+.approval .note.ro { color: var(--dim); background: var(--surface); }
+button { font: inherit; padding: 4px 12px; border-radius: var(--radius); border: 1px solid var(--line);
+  background: var(--card); color: var(--ink); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+button:hover { filter: brightness(1.06); }
+
+/* ---- Board: sections, not columns ---------------------------------------
+   A section is a title row, one hairline, and the space around it. Cards are
+   the only bordered, filled objects on the page, so they hold the attention
+   rather than competing with a frame around every phase.
+
+   The lane colour lives ON the cards instead of on a panel behind them —
+   which is what lets the frames go without losing which section you are in. */
+#board { display: flex; flex-direction: column; gap: 26px; }
+
+.sec { --lane: var(--surface); }
+.sec[data-sec="in progress"] { --lane: var(--rose); }
+.sec[data-sec="review"]      { --lane: var(--accent); }
+
+.sechead {
+  display: flex; align-items: baseline; gap: 12px;
+  padding: 0 2px 8px; border-bottom: 1px solid var(--line);
+  cursor: pointer; user-select: none;
+}
+.sec.shut .sechead { border-bottom-color: transparent; padding-bottom: 0; }
+.sechead:hover .sectitle, .sechead:focus-visible .sectitle { filter: brightness(1.12); }
+.sechead:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.chev { font-size: 10px; color: var(--dim); width: 10px; flex: none; }
+
+/* Deliberately a heading, not a label: 14px and tighter tracking so it reads
+   ahead of the summary beside it. */
+.sectitle {
+  font-size: 14px; font-weight: 600; letter-spacing: .01em;
+  text-transform: lowercase; color: var(--title);
+}
+.sectitle span { color: var(--dim); font-weight: 400; font-size: 12px; }
+.sectitle span::before { content: "["; }
+.sectitle span::after  { content: "]"; }
+.sec[data-sec="in progress"] .sectitle { color: var(--title-active); }
+.sec.shut .sectitle { color: color-mix(in srgb, var(--dim) 72%, var(--ink)); }
+
+.sum { font-size: 11px; color: var(--dim); min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sumright { margin-left: auto; display: flex; gap: 14px; font-size: 11px;
+  color: var(--dim); flex: none; }
+.tone-warn { color: var(--warn); }
+.tone-ok   { color: var(--ok); }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(264px, 1fr));
+  gap: 10px; margin-top: 12px; }
+
+/* Cards carry the lane hue; queued and terminal sections stay neutral. */
+.sec .card { background: color-mix(in srgb, var(--lane) 12%, var(--card)); }
+.sec[data-sec="queued"] .card,
+.sec[data-sec="parked"] .card,
+.sec[data-sec="done"] .card {
+  background: color-mix(in srgb, var(--card) 55%, var(--bg));
+  border-color: color-mix(in srgb, var(--line) 70%, transparent);
+}
+/* Waiting on you, not on an agent. */
+.card.yours { border-left: 2px solid var(--ok); }
+.sec[data-sec="in progress"] .card.yours { border-left-color: var(--warn); }
+
+.card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 9px 10px; }
+.card[draggable="true"] { cursor: grab; }
+.card.dragging { opacity: .4; }
+.card .key { font: 600 12px var(--mono); color: var(--accent); }
+.card .title { margin: 2px 0 6px; }
+.card .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; font-size: 11px; color: var(--dim); }
+.tag { border: 1px solid var(--line); border-radius: var(--radius); padding: 0 5px; }
+.tag.phase { color: var(--busy); border-color: currentColor; }
+.tag.agent-working { color: var(--accent); border-color: currentColor; }
+.tag.agent-blocked { color: var(--warn); border-color: currentColor; }
+.tag.agent-idle, .tag.agent-done { color: var(--ok); border-color: currentColor; }
+a { color: var(--accent); }
+#addwrap { margin-top: 22px; }
+#add { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+#add input, #add select { padding: 5px 8px; border: 1px solid var(--line);
+  border-radius: var(--radius); background: var(--bg); color: var(--ink); font: inherit; }
+#add input[name="title"] { flex: 1; min-width: 200px; }
+#filter, #addproject { font: inherit; padding: 3px 6px; border-radius: var(--radius);
+  border: 1px solid var(--line); background: var(--card); color: var(--ink); }
+.mono { font: 11px ui-monospace, monospace; }
+.tag.trivial { color: var(--warn); border-color: currentColor; }
+.tag.proj { color: var(--ink); border-color: transparent;
+  background: color-mix(in srgb, var(--ink) 10%, transparent); }
+#projlist { margin: 8px 0; display: flex; flex-direction: column; gap: 4px; }
+.prow { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+.prow .nm { font-weight: 600; min-width: 130px; }
+.prow .pth { color: var(--dim); font: 11px ui-monospace, monospace; flex: 1; }
+.prow button { padding: 1px 8px; font-size: 11px; }
+#addproj { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+#addproj input { font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--card); color: var(--ink); }
+#addproj input[name="path"] { flex: 1; min-width: 260px; }
+.cardtop { display: flex; align-items: baseline; gap: 6px; }
+.cardtop .key { flex: 1; }
+button.del { border: none; background: none; color: var(--dim); cursor: pointer;
+  font-size: 15px; line-height: 1; padding: 0 3px; border-radius: var(--radius); opacity: 0; }
+.card:hover button.del, button.del:focus-visible { opacity: 1; }
+button.del:hover { color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, transparent); }
+#sugwrap { margin-bottom: 26px; }
+.sug { background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--busy);
+  border-radius: var(--radius); padding: 9px 12px; margin-bottom: 8px; }
+.sug .hd { display: flex; align-items: baseline; gap: 8px; }
+.sug .t { font-weight: 600; flex: 1; }
+.sug .hits { font-size: 11px; color: var(--accent); border: 1px solid currentColor;
+  border-radius: var(--radius); padding: 0 7px; }
+.sug ul { margin: 6px 0 8px; padding-left: 18px; color: var(--dim); font-size: 12px; }
+.sug .btns { display: flex; gap: 8px; }
+.prow.editing { gap: 8px; }
+.prow input { font: inherit; padding: 3px 7px; border: 1px solid var(--line);
+  border-radius: var(--radius); background: var(--bg); color: var(--ink); }
+.prow input.enm { width: 140px; }
+.prow input.epath { flex: 1; font: 11px ui-monospace, monospace; }
+
+/* ---- Header controls ---------------------------------------------------- */
+#newtask { padding: 3px 12px; }
+.toggle { display: inline-flex; align-items: center; gap: 5px; font-size: 12px;
+  color: var(--dim); cursor: pointer; user-select: none; }
+.toggle input { accent-color: var(--accent); margin: 0; cursor: pointer; }
+
+/* ---- Add-task dialog ---------------------------------------------------- */
+#taskdlg {
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 0;
+  background: var(--card); color: var(--ink); box-shadow: var(--shadow);
+  width: min(440px, calc(100vw - 32px));
+}
+#taskdlg::backdrop { background: rgba(0,0,0,.45); backdrop-filter: blur(2px); }
+#taskdlg h3 { margin: 0 0 4px; font-size: 15px; }
+#add { display: flex; flex-direction: column; gap: 10px; padding: 18px 20px 16px; }
+#add label { display: flex; flex-direction: column; gap: 3px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); }
+#add input, #add select { font: inherit; padding: 6px 9px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--bg); color: var(--ink); text-transform: none; letter-spacing: 0; }
+#add input:focus-visible, #add select:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: -1px; }
+.dlgbtns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+
+.approval .planpath { font: 11px ui-monospace, monospace; color: var(--dim);
+  margin: 2px 0 8px; overflow-wrap: anywhere; }
+.approval .reviewing { font-size: 12px; color: var(--accent);
+  display: inline-flex; align-items: center; }
+
+/* ---- Terminal affordances ----------------------------------------------
+   Catppuccin is already a terminal palette, so the vibe comes from typography
+   and shape rather than new colours: everything is monospace, corners are
+   nearly square, and labels borrow shell punctuation. */
+
+/* Task keys read as identifiers. */
+.card .key { letter-spacing: .02em; }
+.card .key::before { content: "#"; opacity: .45; }
+
+/* Section headings get a prompt marker, matching the h1. */
+#approvals-wrap > h2::before,
+#sugwrap > h2::before { content: "── "; color: var(--line); }
+
+/* Buttons look like commands you could type. */
+button { letter-spacing: .02em; }
+button.primary::before, #newtask::before { content: ""; }
+#newtask { font-weight: 600; }
+
+/* Monospace makes the project chip heavy; lighten it back down. */
+.tag.proj { font-size: 11px; }
+.card .row { font-size: 11px; }
+
+/* A caret in front of the path, like a prompt line. */
+.prow .pth::before { content: "~ "; opacity: .5; }
+.approval .planpath::before { content: "$ "; color: var(--ok); opacity: .8; }
+
+/* Dialog title as a command line. */
+#taskdlg h3 { font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+#taskdlg h3::before { content: "❯ "; color: var(--ok); font-weight: 400; }
+
+
+/* ---- Projects drawer ----------------------------------------------------
+   A right-hand drawer rather than a panel below the board: registering a repo
+   is a rare, deliberate act, and it was competing for vertical space with the
+   lanes. Native <dialog> keeps Esc, focus trapping and the backdrop for free. */
+#projdlg.drawer {
+  border: none; border-left: 1px solid var(--line);
+  border-radius: 0; padding: 0; margin: 0 0 0 auto;
+  height: 100dvh; max-height: 100dvh;
+  width: min(560px, calc(100vw - 48px)); max-width: none;
+  background: var(--surface); color: var(--ink);
+  box-shadow: var(--shadow);
+}
+#projdlg.drawer::backdrop { background: rgba(0,0,0,.45); backdrop-filter: blur(2px); }
+.drawerbody { display: flex; flex-direction: column; gap: 14px;
+  padding: 20px 22px; height: 100%; overflow: auto; }
+.drawerbody h3 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+.drawerbody h3::before { content: "❯ "; color: var(--ok); font-weight: 400; }
+.drawerbody .hint { margin: 0; font-size: 12px; color: var(--dim); max-width: 46ch; }
+.drawerbody .dlgbtns { margin-top: auto; }
+
+@media (prefers-reduced-motion: no-preference) {
+  #projdlg.drawer[open] { animation: slidein .16s ease-out; }
+  @keyframes slidein { from { transform: translateX(12px); opacity: .6; } }
+}
+
+/* The project rows were built for a full-width panel; in a 560px drawer the
+   path crowds the buttons out. Reflow to two lines: identity and actions on
+   the first, the path beneath it. */
+.drawerbody #projlist { gap: 0; }
+.drawerbody .prow {
+  flex-wrap: wrap; align-items: center; gap: 6px 8px;
+  padding: 10px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
+}
+.drawerbody .prow .nm   { order: 0; flex: 1 1 auto; min-width: 0; }
+.drawerbody .prow .dim  { order: 1; }
+.drawerbody .prow button { order: 2; }
+.drawerbody .prow .pth  { order: 9; flex: 1 1 100%; margin: 0; }
+
+/* Editing swaps the row for inputs, which want the full width each. */
+.drawerbody .prow.editing { gap: 8px; }
+.drawerbody .prow.editing input.enm   { order: 0; flex: 1 1 100%; width: auto; }
+.drawerbody .prow.editing input.epath { order: 1; flex: 1 1 100%; }
+.drawerbody .prow.editing button      { order: 2; }
+
+.drawerbody #addproj { flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.drawerbody #addproj input[name="name"] { flex: 1 1 100%; }
+.drawerbody #addproj input[name="path"] { flex: 1 1 100%; min-width: 0; }
+
+/* Unresolved P1/P2 — the thing standing between a task and its PR. */
+.tag.blocking { color: var(--danger); border-color: currentColor; }

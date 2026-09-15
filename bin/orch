@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""orch — state CLI for the herdr orchestrator.
+
+The orchestrator mutates board state through this rather than editing JSON, so
+locking, schema validation and board.md regeneration happen in one place.
+
+  orch init
+  orch project add NAME --path REPO | list | edit NAME [--name NEW] [--path NEW] | remove NAME
+  orch add KEY --title T [--project P] [--source S] [--url U] [--done-when D] [--kind K] [--trivial]
+  orch list [--phase P] [--json]
+  orch show TASK [--json]
+  orch phase TASK PHASE [--note N] [--force]
+  orch set TASK --field VALUE ...      intake:   title, done-when, url, source
+                                       plumbing: branch, workspace, pane, worktree,
+                                                 pr-url, pr-state, reviewer, note,
+                                                 review-round, trivial/no-trivial
+  orch finding add TASK --severity P1 --title T [--where f:line] [--detail D] [--source AGENT]
+  orch finding list TASK [--open] [--blocking]
+  orch finding resolve|dispute|accept|reopen FINDING_ID [--note N]
+  orch suggest --title T --evidence E [--body B] [--project P] [--source AGENT]
+  orch suggestions                     (open improvement suggestions, most-hit first)
+  orch promote SID --key KEY [--project P]   (suggestion -> queued task; human only)
+  orch dismiss SID [--reason R]
+  orch rm TASK [--force]               (delete a task; refused if it owns artifacts)
+  orch next                            (next queued task, if a slot is free)
+  orch resumable                       (workers waiting on a decision that has been made)
+  orch approve-request TASK --kind K --title T [--body B|--body-file F] [--plan-path P]
+  orch approvals [--json]
+  orch resolve APPROVAL --decision approved|rejected [--note N]
+  orch board                           (print board.md)
+  orch cleanup-check TASK              (is it safe to archive this worktree?)
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import store  # noqa: E402
+
+
+def pdir_for(args):
+    return store.board_dir()
+
+
+def resolve_project(st, args):
+    """Explicit --project wins; otherwise infer from where we are standing."""
+    if getattr(args, "project", None):
+        if not store.find_project(st, args.project):
+            known = ", ".join(p["name"] for p in st.get("projects", [])) or "none registered"
+            sys.exit("orch: unknown project %r (known: %s)" % (args.project, known))
+        return args.project
+    p = store.project_for_cwd(st)
+    if p:
+        return p["name"]
+    known = ", ".join(x["name"] for x in st.get("projects", [])) or "none registered"
+    sys.exit("orch: not inside a registered project and no --project given "
+             "(known: %s)" % known)
+
+
+def cmd_init(args):
+    pdir = pdir_for(args)
+    with store.transaction(pdir) as st:
+        st.setdefault("tasks", [])
+        store.log(st, "board initialised")
+    print(pdir)
+
+
+def cmd_project(args):
+    pdir = pdir_for(args)
+    if args.action == "list":
+        st = store.read(pdir)
+        if args.json:
+            print(json.dumps(st.get("projects", []), indent=2)); return
+        if not st.get("projects"):
+            print("no projects registered — orch project add <name> --path <repo>"); return
+        for p in sorted(st["projects"], key=lambda p: p["name"]):
+            n = len([t for t in st["tasks"] if t.get("project") == p["name"]
+                     and t["phase"] not in store.TERMINAL_PHASES])
+            print("%-20s %-4s %s" % (p["name"], n, p["path"]))
+        return
+    with store.transaction(pdir) as st:
+        if args.action == "add":
+            if not args.path:
+                sys.exit("orch: --path is required")
+            rec = store.add_project(st, args.name, args.path)
+            print("%s -> %s" % (rec["name"], rec["path"]))
+        elif args.action == "edit":
+            rec = store.update_project(st, args.name, args.new_name, args.path)
+            print("%s -> %s" % (rec["name"], rec["path"]))
+        elif args.action == "remove":
+            store.remove_project(st, args.name)
+            print("removed %s" % args.name)
+
+
+def cmd_add(args):
+    pdir = pdir_for(args)
+    with store.transaction(pdir) as st:
+        proj = resolve_project(st, args)
+        t = store.add_task(st, args.key, args.title, args.source, args.url,
+                           args.done_when, args.kind, project=proj)
+        if args.trivial:
+            t["trivial"] = True
+            store.log(st, "%s marked trivial: plan approval and review waived" % t["key"])
+    print(json.dumps(t, indent=2))
+
+
+def cmd_list(args):
+    st = store.read(pdir_for(args))
+    tasks = st["tasks"]
+    if args.phase:
+        tasks = [t for t in tasks if t["phase"] == args.phase]
+    if args.project:
+        tasks = [t for t in tasks if t.get("project") == args.project]
+    tasks.sort(key=lambda t: (store.PHASES.index(t["phase"]), t.get("order", 0)))
+    if args.json:
+        print(json.dumps(tasks, indent=2)); return
+    if not tasks:
+        print("no tasks"); return
+    print("%-18s %-12s %-18s %-16s %s" % ("PROJECT", "KEY", "PHASE", "WORKER", "TITLE"))
+    for t in tasks:
+        print("%-18s %-12s %-18s %-16s %s" % (
+            (t.get("project") or "-")[:18], t["key"][:12], t["phase"],
+            (t.get("worker") or "-")[:16], t["title"][:40]))
+    print("\n%d active / max %s" % (len(store.active_tasks(st)), st.get("max_active", 3)))
+
+
+def cmd_show(args):
+    st = store.read(pdir_for(args))
+    t = store.find(st, args.task)
+    if not t:
+        sys.exit("no task %r" % args.task)
+    # Include the resolved repo root: the spawn path needs it and the caller is
+    # usually not standing in that repo.
+    out = dict(t); out["repo"] = store.task_repo(st, t)
+    if args.json:
+        print(json.dumps(out, indent=2)); return
+    for k, v in out.items():
+        print("%-12s %s" % (k, v))
+    pend = [a for a in store.pending_approvals(st) if a["task"] == t["id"]]
+    for a in pend:
+        print("\npending approval %s (%s): %s" % (a["id"], a["kind"], a["title"]))
+
+
+def cmd_phase(args):
+    pdir = pdir_for(args)
+    with store.transaction(pdir) as st:
+        if args.phase in store.ACTIVE_PHASES:
+            t = store.find(st, args.task)
+            if t and t["phase"] not in store.ACTIVE_PHASES and not store.can_start(st):
+                sys.exit("at max_active (%s); free a slot or raise it before starting %s"
+                         % (st.get("max_active", 3), args.task))
+        t = store.set_phase(st, args.task, args.phase, args.note, force=args.force)
+    print("%s -> %s" % (t["key"], t["phase"]))
+
+
+# argparse dests that carry a value, so they can be swept straight out of the
+# namespace. `trivial` is excluded because it arrives as a pair of store_true
+# flags rather than a value, and False would otherwise read as "set it False".
+VALUE_FIELDS = [f for f in store.EDITABLE_FIELDS if f != "trivial"]
+
+
+def count_arg(field):
+    """argparse type for a count field.
+
+    Rejecting at the parser means a bad value never reaches the store and never
+    takes the board lock, and the user gets a usage message rather than a
+    traceback. `store.as_count` is still the authority — it has to be, because
+    the webapp reaches `update_task` without passing through argparse at all.
+    """
+    flag = "--" + field.replace("_", "-")
+
+    def parse(v):
+        try:
+            return store.as_count(field, v)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                '%s takes a whole number, zero or more (got %r). Pass 0 to record '
+                'no rounds; "" does not clear it.' % (flag, v))
+    return parse
+
+
+def cmd_set(args):
+    pdir = pdir_for(args)
+    updates = {k: v for k, v in vars(args).items()
+               if k in VALUE_FIELDS and v is not None}
+    if args.trivial:
+        updates["trivial"] = True
+    if args.no_trivial:
+        updates["trivial"] = False
+    if not updates:
+        sys.exit("nothing to set")
+    with store.transaction(pdir) as st:
+        t = store.update_task(st, args.task, updates)
+        # Read back rather than echoing the arguments: a field cleared with ""
+        # is stored as null, and the caller should see what landed.
+        written = {k: t[k] for k in sorted(updates)}
+    print(json.dumps(written))
+
+
+def cmd_finding(args):
+    pdir = pdir_for(args)
+    if args.action == "list":
+        st = store.read(pdir)
+        rows = store.findings_for(st, args.target, open_only=args.open,
+                                  blocking_only=args.blocking)
+        if args.json:
+            print(json.dumps(rows, indent=2)); return
+        if not rows:
+            print("no findings"); return
+        for f in rows:
+            mark = {"open": "·", "disputed": "!", "resolved": "✓", "accepted": "~"}[f["status"]]
+            print("%s %-10s %-3s %-9s %s" % (mark, f["id"], f["severity"], f["status"], f["title"]))
+            if f.get("where"):
+                print("%-13s %s" % ("", f["where"]))
+            if f.get("response"):
+                print("%-13s response: %s" % ("", f["response"]))
+        blockers = store.blocking_open(st, args.target)
+        print("\n%d blocking open" % len(blockers))
+        return
+
+    with store.transaction(pdir) as st:
+        if args.action == "add":
+            for req in ("severity", "title"):
+                if not getattr(args, req):
+                    sys.exit("orch: --%s is required" % req)
+            detail = args.detail or ""
+            if args.detail_file:
+                with open(args.detail_file) as fh:
+                    detail = fh.read()
+            f = store.add_finding(st, args.target, args.severity, args.title,
+                                  detail, args.where, args.source)
+            print("%s %s %s" % (f["id"], f["severity"], f["title"]))
+        else:
+            status = {"resolve": "resolved", "dispute": "disputed",
+                      "accept": "accepted", "reopen": "open"}[args.action]
+            if args.action in ("dispute",) and not args.note:
+                sys.exit("orch: --note is required when disputing — it is what the "
+                         "reviewer re-reads")
+            f = store.set_finding(st, args.target, status, args.note)
+            print("%s -> %s" % (f["id"], f["status"]))
+
+
+def cmd_suggest(args):
+    pdir = pdir_for(args)
+    body = args.body or ""
+    if args.body_file:
+        with open(args.body_file) as fh:
+            body = fh.read()
+    with store.transaction(pdir) as st:
+        proj = args.project
+        if proj and not store.find_project(st, proj):
+            sys.exit("orch: unknown project %r" % proj)
+        x = store.add_suggestion(st, args.title, args.evidence, body,
+                                 source=args.source, project=proj)
+    n = x.get("seconded", 0)
+    print("%s %s: %s" % (x["id"], "seconded (%dx)" % (n + 1) if n else "filed", x["title"]))
+
+
+def cmd_suggestions(args):
+    st = store.read(pdir_for(args))
+    sugs = sorted(store.open_suggestions(st), key=lambda x: -x.get("seconded", 0))
+    if args.json:
+        print(json.dumps(sugs, indent=2)); return
+    if not sugs:
+        print("no open suggestions"); return
+    for x in sugs:
+        print("%-10s %-4s %-20s %s" % (x["id"], "%dx" % (x.get("seconded", 0) + 1),
+                                       (x.get("project") or "tooling")[:20], x["title"]))
+        for e in x.get("evidence", [])[:3]:
+            print("%-10s   - %s" % ("", e))
+
+
+def cmd_promote(args):
+    pdir = pdir_for(args)
+    with store.transaction(pdir) as st:
+        t = store.promote_suggestion(st, args.suggestion, args.key,
+                                     args.project, args.trivial)
+        active = len(store.active_tasks(st))
+        proj = t.get("project")
+    print("%s -> %s/%s (queued)" % (args.suggestion, proj, t["key"]))
+    # Editing the orchestrator while it is driving agents is a real hazard.
+    if proj and "orchestrat" in proj and active:
+        print("note: %d agent(s) are live and this task targets the orchestrator itself; "
+              "consider letting them finish before dispatching it" % active, file=sys.stderr)
+
+
+def cmd_dismiss(args):
+    pdir = pdir_for(args)
+    with store.transaction(pdir) as st:
+        store.dismiss_suggestion(st, args.suggestion, args.reason)
+    print("dismissed %s" % args.suggestion)
+
+
+def cmd_rm(args):
+    pdir = pdir_for(args)
+    with store.transaction(pdir) as st:
+        t = store.delete_task(st, args.task, force=args.force)
+    print("deleted %s/%s" % (t.get("project"), t["key"]))
+
+
+def cmd_next(args):
+    st = store.read(pdir_for(args))
+    if not store.can_start(st):
+        print("at capacity: %d active / max %s" % (len(store.active_tasks(st)), st.get("max_active", 3)))
+        return
+    t = store.next_queued(st)
+    print(json.dumps(t, indent=2) if t else "queue empty")
+
+
+def cmd_approve_request(args):
+    body = args.body or ""
+    if args.body_file:
+        with open(args.body_file) as fh:
+            body = fh.read()
+    pdir = pdir_for(args)
+    with store.transaction(pdir) as st:
+        plan = os.path.abspath(args.plan_path) if args.plan_path else None
+        if plan and not os.path.isfile(plan):
+            sys.exit("orch: no such plan file: %s" % plan)
+        a = store.add_approval(st, args.task, args.kind, args.title, body, plan)
+    print(json.dumps({"id": a["id"], "kind": a["kind"]}))
+
+
+def cmd_approvals(args):
+    st = store.read(pdir_for(args))
+    pend = store.pending_approvals(st)
+    if args.json:
+        print(json.dumps(pend, indent=2)); return
+    if not pend:
+        print("nothing pending"); return
+    for a in pend:
+        print("%s  %-14s %-16s %s" % (a["id"], a["key"], a["kind"], a["title"]))
+
+
+def cmd_resumable(args):
+    """Workers waiting on an answer that has arrived. Prompt them."""
+    st = store.read(pdir_for(args))
+    rows = store.resumable(st)
+    if args.json:
+        print(json.dumps([{"task": t, "approval": a} for t, a in rows], indent=2)); return
+    if not rows:
+        print("nothing to resume"); return
+    for t, a in rows:
+        print("%-12s %-16s %-10s %s" % (t["key"], t.get("worker") or "-", a["status"], a["title"]))
+        if a.get("decision_note"):
+            print("%-12s   note: %s" % ("", a["decision_note"]))
+
+
+def cmd_resolve(args):
+    pdir = pdir_for(args)
+    with store.transaction(pdir) as st:
+        a = store.resolve_approval(st, args.approval, args.decision, args.note)
+    print("%s %s" % (a["key"], a["status"]))
+
+
+def cmd_board(args):
+    p = os.path.join(pdir_for(args), "board.md")
+    if not os.path.exists(p):
+        sys.exit("no board yet — run `orch init`")
+    with open(p) as fh:
+        sys.stdout.write(fh.read())
+
+
+def cmd_cleanup_check(args):
+    """Three guards before archiving a worktree. Any failure means ask the human."""
+    st = store.read(pdir_for(args))
+    t = store.find(st, args.task)
+    if not t:
+        sys.exit("no task %r" % args.task)
+    wt, problems = t.get("worktree"), []
+
+    if t.get("pr_url"):
+        try:
+            out = subprocess.run(["gh", "pr", "view", t["pr_url"], "--json", "state,mergedAt"],
+                                 capture_output=True, text=True, check=True).stdout
+            pr = json.loads(out)
+            if pr.get("state") != "MERGED":
+                problems.append("PR state is %s, not MERGED" % pr.get("state"))
+        except Exception as e:
+            problems.append("could not confirm PR merged (%s)" % e)
+    else:
+        problems.append("no PR recorded")
+
+    if not wt or not os.path.isdir(wt):
+        problems.append("worktree path missing: %s" % wt)
+    else:
+        dirty = subprocess.run(["git", "-C", wt, "status", "--porcelain"],
+                               capture_output=True, text=True).stdout.strip()
+        if dirty:
+            problems.append("uncommitted changes (%d files)" % len(dirty.splitlines()))
+        unpushed = subprocess.run(["git", "-C", wt, "log", "--oneline", "@{u}..HEAD"],
+                                  capture_output=True, text=True)
+        if unpushed.returncode == 0 and unpushed.stdout.strip():
+            problems.append("unpushed commits (%d)" % len(unpushed.stdout.strip().splitlines()))
+
+    print(json.dumps({"safe": not problems, "problems": problems,
+                      "project": t.get("project"), "repo": store.task_repo(st, t),
+                      "worktree": wt, "branch": t.get("branch")}, indent=2))
+    sys.exit(0 if not problems else 1)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="orch", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init").set_defaults(fn=cmd_init)
+
+    a = sub.add_parser("project"); a.set_defaults(fn=cmd_project)
+    a.add_argument("action", choices=["add", "list", "edit", "remove"])
+    a.add_argument("name", nargs="?")
+    a.add_argument("--path"); a.add_argument("--json", action="store_true")
+    a.add_argument("--name", dest="new_name", help="rename (edit only)")
+
+    a = sub.add_parser("add"); a.set_defaults(fn=cmd_add)
+    a.add_argument("key"); a.add_argument("--title", required=True)
+    a.add_argument("--project", help="registered project name; inferred from cwd if omitted")
+    a.add_argument("--source", default="manual"); a.add_argument("--url")
+    a.add_argument("--done-when", dest="done_when"); a.add_argument("--kind", default="claude")
+    a.add_argument("--trivial", action="store_true",
+                   help="waive plan approval and review; recorded as a decision, not an omission")
+
+    a = sub.add_parser("list"); a.set_defaults(fn=cmd_list)
+    a.add_argument("--phase"); a.add_argument("--project")
+    a.add_argument("--json", action="store_true")
+
+    a = sub.add_parser("show"); a.set_defaults(fn=cmd_show)
+    a.add_argument("task"); a.add_argument("--json", action="store_true")
+
+    a = sub.add_parser("phase"); a.set_defaults(fn=cmd_phase)
+    a.add_argument("task"); a.add_argument("phase", choices=store.PHASES)
+    a.add_argument("--note")
+    a.add_argument("--force", action="store_true",
+                   help="override the review gate on pr-open")
+
+    a = sub.add_parser("set", description='Edit a task in place. Pass "" to clear a field, '
+                                          'except --title, which has to stay readable, and '
+                                          '--review-round, which takes a whole number — pass 0 '
+                                          'to record no rounds.')
+    a.set_defaults(fn=cmd_set)
+    a.add_argument("task")
+    for field in VALUE_FIELDS:
+        kw = {"type": count_arg(field)} if field in store.INT_FIELDS else {}
+        a.add_argument("--" + field.replace("_", "-"), dest=field, **kw)
+    a.add_argument("--trivial", action="store_true")
+    a.add_argument("--no-trivial", dest="no_trivial", action="store_true")
+
+    a = sub.add_parser("finding"); a.set_defaults(fn=cmd_finding)
+    a.add_argument("action", choices=["add", "list", "resolve", "dispute", "accept", "reopen"])
+    a.add_argument("target", help="task for add/list; finding id for the rest")
+    a.add_argument("--severity", choices=store.SEVERITIES)
+    a.add_argument("--title"); a.add_argument("--detail")
+    a.add_argument("--detail-file", dest="detail_file")
+    a.add_argument("--where", help="file:line the finding points at")
+    a.add_argument("--source", help="reviewer agent name")
+    a.add_argument("--note", help="response recorded on resolve/dispute/accept")
+    a.add_argument("--open", action="store_true", help="list only unresolved")
+    a.add_argument("--blocking", action="store_true", help="list only P1/P2")
+    a.add_argument("--json", action="store_true")
+
+    a = sub.add_parser("suggest"); a.set_defaults(fn=cmd_suggest)
+    a.add_argument("--title", required=True)
+    a.add_argument("--evidence", required=True,
+                   help="what actually happened in this task that cost time or went wrong")
+    a.add_argument("--body"); a.add_argument("--body-file", dest="body_file")
+    a.add_argument("--project", help="omit if this is about the orchestrator tooling itself")
+    a.add_argument("--source", help="your agent name")
+
+    a = sub.add_parser("suggestions"); a.set_defaults(fn=cmd_suggestions)
+    a.add_argument("--json", action="store_true")
+
+    a = sub.add_parser("promote"); a.set_defaults(fn=cmd_promote)
+    a.add_argument("suggestion"); a.add_argument("--key", required=True)
+    a.add_argument("--project"); a.add_argument("--trivial", action="store_true")
+
+    a = sub.add_parser("dismiss"); a.set_defaults(fn=cmd_dismiss)
+    a.add_argument("suggestion"); a.add_argument("--reason")
+
+    a = sub.add_parser("rm"); a.set_defaults(fn=cmd_rm)
+    a.add_argument("task"); a.add_argument("--force", action="store_true",
+                   help="drop the record even if it still owns a worktree or PR")
+
+    sub.add_parser("next").set_defaults(fn=cmd_next)
+
+    a = sub.add_parser("resumable"); a.set_defaults(fn=cmd_resumable)
+    a.add_argument("--json", action="store_true")
+
+    a = sub.add_parser("approve-request"); a.set_defaults(fn=cmd_approve_request)
+    a.add_argument("task"); a.add_argument("--kind", required=True, choices=store.APPROVAL_KINDS)
+    a.add_argument("--title", required=True); a.add_argument("--body")
+    a.add_argument("--body-file", dest="body_file")
+    a.add_argument("--plan-path", dest="plan_path",
+                   help="markdown/HTML file to open in Plannotator for review")
+
+    a = sub.add_parser("approvals"); a.set_defaults(fn=cmd_approvals)
+    a.add_argument("--json", action="store_true")
+
+    a = sub.add_parser("resolve"); a.set_defaults(fn=cmd_resolve)
+    a.add_argument("approval"); a.add_argument("--decision", required=True,
+                                               choices=["approved", "rejected"])
+    a.add_argument("--note")
+
+    sub.add_parser("board").set_defaults(fn=cmd_board)
+
+    a = sub.add_parser("cleanup-check"); a.set_defaults(fn=cmd_cleanup_check)
+    a.add_argument("task")
+
+    args = p.parse_args()
+    try:
+        args.fn(args)
+    except (ValueError, KeyError) as e:
+        # Rule violations (the review gate, unknown phase, missing task) are
+        # expected outcomes, not crashes. A traceback buries the guidance.
+        sys.exit("orch: %s" % (e.args[0] if e.args else e))
+
+
+if __name__ == "__main__":
+    main()

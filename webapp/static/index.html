@@ -1,0 +1,67 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orchestrator board</title>
+<link rel="stylesheet" href="/style.css">
+<header>
+  <h1>Orchestrator</h1>
+  <select id="filter" title="filter by project"><option value="">all projects</option></select>
+  <button id="newtask" class="primary">+ Add task</button>
+  <button id="openproj">Projects</button>
+  <div class="meta">
+    <span id="wip" class="pill"></span>
+    <label class="cap">max <input id="max" type="number" min="1" max="10" step="1"></label>
+    <span id="updated" class="dim"></span>
+  </div>
+</header>
+
+<section id="approvals-wrap" hidden>
+  <h2>Awaiting you</h2>
+  <div id="approvals"></div>
+</section>
+
+<section id="sugwrap" hidden>
+  <h2>Suggestions <span id="sugcount" class="dim"></span></h2>
+  <div id="suggestions"></div>
+</section>
+
+<main id="board"></main>
+
+<dialog id="projdlg" class="drawer">
+  <div class="drawerbody">
+    <h3>Projects</h3>
+    <p class="hint">A project is a registered repository. Work can be created against
+      it from anywhere once it is here.</p>
+    <div id="projlist"></div>
+    <form id="addproj">
+      <input name="name" placeholder="short-name" required pattern="[a-z0-9][a-z0-9_-]*"
+             title="lowercase letters, digits, dash or underscore">
+      <input name="path" placeholder="/path/to/repo" required>
+      <button class="primary">Register</button>
+    </form>
+    <div class="dlgbtns"><button type="button" id="closeproj">Close</button></div>
+  </div>
+</dialog>
+
+<dialog id="taskdlg">
+  <form id="add">
+    <h3>Add a task</h3>
+    <label>Project<select name="project" id="addproject" required></select></label>
+    <label>Key<input name="key" placeholder="GH-412 / PROJ-88 / short-slug" required autofocus></label>
+    <label>Title<input name="title" placeholder="What needs doing" required></label>
+    <label>Source<select name="source">
+      <option value="manual">manual</option>
+      <option value="github">github</option>
+      <option value="jira">jira</option>
+      <option value="notion">notion</option>
+    </select></label>
+    <label>URL<input name="url" placeholder="optional"></label>
+    <label>Done when<input name="done_when" placeholder="optional — how you'll know it's finished"></label>
+    <div class="dlgbtns">
+      <button type="button" id="canceltask">Cancel</button>
+      <button class="primary">Add to queue</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/app.js"></script>

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "herdr-tools",
+  "description": "Tools for running fleets of coding agents under Herdr",
+  "owner": {
+    "name": "maulik13"
+  },
+  "plugins": [
+    {
+      "name": "herdr-orchestrator",
+      "description": "Orchestrate multiple coding agents across separate issues using Herdr, with worktree-isolated workers and a persistent board that survives context clears",
+      "author": {
+        "name": "maulik13"
+      },
+      "category": "workflow",
+      "source": "./"
+    }
+  ]
+}
