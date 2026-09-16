@@ -53,6 +53,7 @@ worktree. A project cannot be removed while it still has live tasks.
   "pr_url": null,
   "pr_state": null,
   "review_round": 0,
+  "trivial": false,
   "note": null
 }
 ```
@@ -78,6 +79,12 @@ The webapp shows `implementing`, `planning` and `awaiting-plan` in one
 **In progress** column split into two swimlanes, implementation above planning.
 The phases themselves are unchanged — that grouping is presentation only, and
 `board.md` orders the column the same way.
+
+`review_round` counts rounds the reviewer has **handed back**, incremented on
+`reviewing` -> `resolving`. Two things read it: findings are labelled with the
+round in flight (`review_round + 1`), and both gates depend on it — `pr-open` is
+refused for a task with no completed round that is not `trivial`, and a third
+`reviewing` is refused so a disagreement escalates instead of looping.
 
 Everything from `planning` through `awaiting-decision` counts against
 `max_active`. `pr-open` deliberately does not: a PR can wait days on human
@@ -105,6 +112,47 @@ Anything needing the human is an approval record, surfaced in the webapp's
 Keep `title` to one line — it is the whole card in a scan — and put reasoning in
 `body` via `--body-file`. A rejection carries `decision_note`, which is what the
 worker reads to know what to change.
+
+Resolving an approval records a **handoff**, because the worker that raised it
+stopped and no agent is present when a human clicks. That is the one wake-up
+nothing else in the system can raise.
+
+## Handoffs
+
+A handoff says a task's next move belongs to the orchestrator. `orch phase`
+records one whenever the agent making the move is not the one who acts next —
+the reviewer handing findings back, a worker ready for review, a decision
+answered, a PR merged — and then prompts the orchestrator, which has no
+background loop and would otherwise wait on a human to notice.
+
+```json
+{ "id": "h52848112", "task": "t52847411", "key": "GH-412", "project": "infra",
+  "phase": "resolving", "reason": "review round finished — relay the findings to
+  the worker", "status": "pending", "notified": "prompted orchestrator" }
+```
+
+One row per task, updated in place: a task that bounces between `needs-review`
+and `resolving` is one thing needing attention, and only the newest reason is
+still true. `orch handoffs` lists what is pending; `orch ack <task>` clears a
+row once the orchestrator has acted — after acting, never on receipt.
+
+`notified` is how the wake-up went. It matters because the board record is
+durable and the prompt is not: the orchestrator may be mid-turn, restarted into
+a new pane, or gone. A `failed:` value is why a row is still sitting there, and
+unclaimed rows render on `board.md` under **Awaiting the orchestrator** so a
+silent orchestrator is visible to the human rather than looking like a healthy
+board where nothing moves.
+
+The wake-up text is a fixed template — key, phase, and a reason from the store's
+own transition table. Never agent prose: it arrives in the only agent permitted
+to spawn agents.
+
+`orchestrator` is a single board-level record of who to wake, written by
+`orch whoami --agent <name> --pane <id>` at preflight. It lives on the board
+rather than in the orchestrator's context precisely because that context is
+expected to be cleared. The agent name is preferred over the pane id — herdr
+clears a name when its pane occupant exits, so a stale name fails loudly instead
+of landing a prompt in whatever occupies that pane now.
 
 ## Notes and log
 

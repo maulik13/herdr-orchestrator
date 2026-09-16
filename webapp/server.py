@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import notify  # noqa: E402
 import store  # noqa: E402
 
 STATIC = os.path.join(os.path.dirname(os.path.realpath(__file__)), "static")
@@ -77,6 +78,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             body = self._body()
+            handoff = None
             with store.transaction(PDIR) as st:
                 if path == "/api/task":
                     store.add_task(st, body["key"], body["title"],
@@ -106,9 +108,21 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/reorder":
                     store.reorder(st, body["ids"])
                 elif path == "/api/phase":
-                    store.set_phase(st, body["task"], body["phase"], body.get("note"))
+                    # Guard on the transition, not just on a pending handoff:
+                    # dragging a card that already had one waiting must not
+                    # re-prompt the orchestrator about it.
+                    cur = store.find(st, body["task"])
+                    old = cur["phase"] if cur else None
+                    t = store.set_phase(st, body["task"], body["phase"], body.get("note"))
+                    if store.handoff_reason(old, t["phase"]):
+                        handoff = _handoff_for(st, t["id"])
                 elif path == "/api/resolve":
-                    store.resolve_approval(st, body["approval"], body["decision"], body.get("note"))
+                    # Answering a card is the handoff nothing else can record:
+                    # the worker that raised it stopped and ended its turn, and
+                    # no agent is present at the moment the button is clicked.
+                    a = store.resolve_approval(st, body["approval"], body["decision"],
+                                               body.get("note"))
+                    handoff = _handoff_for(st, a["task"])
                 elif path == "/api/project":
                     store.add_project(st, body["name"], body["path"])
                 elif path == "/api/project/update":
@@ -121,9 +135,30 @@ class Handler(BaseHTTPRequestHandler):
                     store.log(st, "max_active set to %s" % st["max_active"])
                 else:
                     return self._json({"error": "unknown endpoint"}, 404)
+            # After the transaction, and on its own thread: `notify.wake` takes
+            # the board lock to record the outcome, so calling it inside the
+            # `with` would deadlock this process against itself, and a herdr
+            # round-trip has no business delaying the HTTP response.
+            _wake_later(handoff)
             return self._json({"ok": True})
         except Exception as e:
             return self._json({"error": str(e)}, 400)
+
+
+def _handoff_for(st, tid):
+    """A snapshot of the task's pending handoff, safe to use after the lock."""
+    rows = store.pending_handoffs(st, tid)
+    return dict(rows[0]) if rows else None
+
+
+def _wake_later(handoff):
+    """Send a handoff's wake-up prompt off the request/poll thread.
+
+    Always on a thread, never inline: `notify.wake` reopens the board to record
+    the outcome, and this process would block on its own flock.
+    """
+    if handoff:
+        threading.Thread(target=notify.wake, args=(PDIR, handoff), daemon=True).start()
 
 
 def run_plannotator_gate(approval_id, plan_path):
@@ -155,6 +190,7 @@ def run_plannotator_gate(approval_id, plan_path):
     decision = verdict.get("decision")
     feedback = (verdict.get("feedback") or "").strip() or None
 
+    handoff = None
     with store.transaction(PDIR) as st:
         a = next((x for x in st.get("approvals", []) if x["id"] == approval_id), None)
         if not a:
@@ -162,14 +198,19 @@ def run_plannotator_gate(approval_id, plan_path):
         a["review_started"] = None
         if a["status"] != "pending":
             return          # settled elsewhere while the gate was open
-        if decision == "approved":
-            store.resolve_approval(st, approval_id, "approved", feedback)
-        elif decision == "annotated":
-            store.resolve_approval(st, approval_id, "rejected", feedback)
+        if decision in ("approved", "annotated"):
+            store.resolve_approval(st, approval_id,
+                                   "approved" if decision == "approved" else "rejected",
+                                   feedback)
+            handoff = _handoff_for(st, a["task"])
         else:
             # dismissed, or the gate failed to start: leave it for the human.
             store.log(st, "%s plan review closed without a decision (%s)"
                       % (a["key"], decision or "no result"))
+    # A Plannotator verdict is the human deciding without touching the board,
+    # so without this the annotations land in state.json and the worker that
+    # needs them never hears.
+    _wake_later(handoff)
 
 
 def poll_prs(interval):
@@ -215,6 +256,7 @@ def poll_prs(interval):
         if not found:
             continue
 
+        handoffs = []
         with store.transaction(PDIR) as st2:
             for tid, state in found.items():
                 t = store.find(st2, tid)
@@ -223,12 +265,15 @@ def poll_prs(interval):
                 if state == "MERGED":
                     t["pr_state"] = "merged"
                     store.set_phase(st2, tid, "merged", "PR merged; awaiting cleanup")
+                    handoffs.append(_handoff_for(st2, tid))
                 else:
                     t["pr_state"] = "closed"
                     store.add_approval(
                         st2, tid, "question", "PR closed without merging",
                         "%s was closed but never merged. Decide whether to reopen it, "
                         "or what should happen to the branch and worktree." % t.get("pr_url"))
+        for h in handoffs:
+            _wake_later(h)
 
 
 def main():

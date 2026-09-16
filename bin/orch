@@ -24,6 +24,9 @@ locking, schema validation and board.md regeneration happen in one place.
   orch rm TASK [--force]               (delete a task; refused if it owns artifacts)
   orch next                            (next queued task, if a slot is free)
   orch resumable                       (workers waiting on a decision that has been made)
+  orch whoami [--agent NAME] [--pane ID]    (register/print who to wake for a handoff)
+  orch handoffs [--json]               (tasks waiting on the orchestrator)
+  orch ack TASK                        (handoff picked up; clears it)
   orch approve-request TASK --kind K --title T [--body B|--body-file F] [--plan-path P]
   orch approvals [--json]
   orch resolve APPROVAL --decision approved|rejected [--note N]
@@ -37,6 +40,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import notify  # noqa: E402
 import store  # noqa: E402
 
 
@@ -145,14 +149,28 @@ def cmd_show(args):
 
 def cmd_phase(args):
     pdir = pdir_for(args)
+    handoff = None
     with store.transaction(pdir) as st:
         if args.phase in store.ACTIVE_PHASES:
             t = store.find(st, args.task)
             if t and t["phase"] not in store.ACTIVE_PHASES and not store.can_start(st):
                 sys.exit("at max_active (%s); free a slot or raise it before starting %s"
                          % (st.get("max_active", 3), args.task))
+        # Read the phase we are leaving before the write: whether anyone has to
+        # be woken depends on the pair, not the destination.
+        cur = store.find(st, args.task)
+        old = cur["phase"] if cur else None
         t = store.set_phase(st, args.task, args.phase, args.note, force=args.force)
-    print("%s -> %s" % (t["key"], t["phase"]))
+        if store.handoff_reason(old, t["phase"]):
+            rows = store.pending_handoffs(st, t["id"])
+            handoff = dict(rows[0]) if rows else None
+    print("%s -> %s" % (t["key"], t["phase"]), flush=True)
+    # Outside the transaction on purpose. `herdr agent prompt` is a socket
+    # round-trip, and holding the board lock across it would stall the
+    # orchestrator and every other worker behind this one write. The flush
+    # above keeps the two lines in order when stdout is a pipe.
+    if handoff:
+        print("handoff: %s" % notify.wake(pdir, handoff), file=sys.stderr)
 
 
 # argparse dests that carry a value, so they can be swept straight out of the
@@ -350,9 +368,58 @@ def cmd_resumable(args):
 
 def cmd_resolve(args):
     pdir = pdir_for(args)
+    handoff = None
     with store.transaction(pdir) as st:
         a = store.resolve_approval(st, args.approval, args.decision, args.note)
-    print("%s %s" % (a["key"], a["status"]))
+        rows = store.pending_handoffs(st, a["task"])
+        handoff = dict(rows[0]) if rows else None
+    print("%s %s" % (a["key"], a["status"]), flush=True)
+    if handoff:
+        print("handoff: %s" % notify.wake(pdir, handoff), file=sys.stderr)
+
+
+def cmd_whoami(args):
+    """Register, or print, the agent a handoff should wake."""
+    pdir = pdir_for(args)
+    if not args.agent and not args.pane:
+        st = store.read(pdir)
+        if args.json:
+            print(json.dumps(st.get("orchestrator"), indent=2)); return
+        target = store.orchestrator_target(st)
+        if not target:
+            sys.exit("orch: no orchestrator registered — run "
+                     "`orch whoami --agent <name> --pane \"$HERDR_PANE_ID\"` in its pane")
+        print(target)
+        return
+    with store.transaction(pdir) as st:
+        rec = store.set_orchestrator(st, args.agent, args.pane)
+    print(json.dumps(rec))
+
+
+def cmd_handoffs(args):
+    """The orchestrator's inbox: what changed hands while it was not looking."""
+    st = store.read(pdir_for(args))
+    rows = store.pending_handoffs(st)
+    if args.json:
+        print(json.dumps(rows, indent=2)); return
+    if not rows:
+        print("nothing waiting"); return
+    for h in rows:
+        t = store.find(st, h["task"])
+        print("%-12s %-16s %-16s %s" % (h["key"], h["phase"],
+                                        (t.get("worker") if t else None) or "-", h["reason"]))
+        # A failed wake-up is why this row is still here, so say so: the fix is
+        # usually re-registering after a restart, not chasing the worker.
+        if (h.get("notified") or "").startswith("failed"):
+            print("%-12s   wake-up did not land: %s" % ("", h["notified"]))
+    print("\n%d waiting — `orch ack <task>` once you have acted" % len(rows))
+
+
+def cmd_ack(args):
+    pdir = pdir_for(args)
+    with store.transaction(pdir) as st:
+        done = store.clear_handoff(st, args.task)
+    print("acked %d handoff(s) for %s" % (len(done), args.task))
 
 
 def cmd_board(args):
@@ -433,7 +500,8 @@ def main():
     a.add_argument("task"); a.add_argument("phase", choices=store.PHASES)
     a.add_argument("--note")
     a.add_argument("--force", action="store_true",
-                   help="override the review gate on pr-open")
+                   help="override the review gate on pr-open, or the two-round cap "
+                        "on reviewing")
 
     a = sub.add_parser("set", description='Edit a task in place. Pass "" to clear a field, '
                                           'except --title, which has to stay readable, and '
@@ -486,6 +554,19 @@ def main():
 
     a = sub.add_parser("resumable"); a.set_defaults(fn=cmd_resumable)
     a.add_argument("--json", action="store_true")
+
+    a = sub.add_parser("whoami", description="Register the agent that handoffs should wake, "
+                                             "or print it when called with no flags.")
+    a.set_defaults(fn=cmd_whoami)
+    a.add_argument("--agent", help="herdr agent name, e.g. orchestrator")
+    a.add_argument("--pane", help="fallback target: $HERDR_PANE_ID")
+    a.add_argument("--json", action="store_true")
+
+    a = sub.add_parser("handoffs"); a.set_defaults(fn=cmd_handoffs)
+    a.add_argument("--json", action="store_true")
+
+    a = sub.add_parser("ack"); a.set_defaults(fn=cmd_ack)
+    a.add_argument("task")
 
     a = sub.add_parser("approve-request"); a.set_defaults(fn=cmd_approve_request)
     a.add_argument("task"); a.add_argument("--kind", required=True, choices=store.APPROVAL_KINDS)

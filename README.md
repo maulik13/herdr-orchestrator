@@ -118,8 +118,10 @@ The parts worth knowing:
 
 - **Plan approval before code.** The worker researches, checks the requirement is unambiguous, and submits a TLDR with tradeoffs and risks. Ambiguity becomes a `question` card rather than a guess.
 - **Adversarial review in fresh context.** When implementation lands, the orchestrator starts a *separate* reviewer in a sibling pane of the same worktree. Fresh context is the point — a reviewer that watched the code get written inherits its author's assumptions.
+- **Handoffs wake the next agent.** Herdr has no event bus and the orchestrator has no background loop, so an agent that finishes and stops would leave the next one asleep until you noticed. `orch phase` closes that: when the next move isn't yours, it records a handoff and prompts the orchestrator, which relays. Findings, plans and decisions stay on the board — the prompt carries only a key, a phase and a fixed reason, so nothing an agent wrote can reach the one agent allowed to spawn agents. Unclaimed handoffs show on the board as **Awaiting the orchestrator**, with whether the wake-up landed, so a restarted orchestrator is visible rather than silent.
+- **Findings are judged, not just obeyed.** The implementer checks each one for correctness, scope against the done-condition, and severity before touching code. A valid finding outside this issue's scope gets disputed and filed, not quietly folded into the diff.
 - **P1/P2 block, P3 advises** — and the board enforces it. Reviewers file findings with `orch finding add`; `orch phase <task> pr-open` refuses while any P1 or P2 is open or disputed, and names them. Findings live on the board rather than in a `REVIEW.md`, because a file in a worktree dies with the worktree, is invisible until you open a pane, and cannot answer "is this resolved?" mechanically.
-- **Two rounds, then you.** The same reviewer re-checks its own findings, but disagreement is capped — after round two it becomes a `conflict` card with both positions.
+- **Two rounds, then you.** The same reviewer re-checks its own findings, but disagreement is capped — and the cap is enforced by the store, not by the orchestrator remembering: `orch phase <task> reviewing` refuses a third round and names the escalation. After round two it becomes a `conflict` card with both positions.
 - **Breaking changes need explicit approval** before implementation, not after.
 - **Trivial work can skip both gates, but only on purpose.** `orch add --trivial` waives the plan approval and the reviewer for a typo or a version bump. Entering `pr-open` is refused for anything neither trivial nor reviewed, so the difference between an agreed shortcut and a skipped review stays visible.
 - **Merge detection is automatic, cleanup is not.** The webapp notices the merge; the orchestrator then runs `orch cleanup-check`, which confirms the PR is genuinely `MERGED`, the tree is clean, and nothing is unpushed before any worktree is removed. `git branch -d` (not `-D`) is a second independent check.
@@ -141,6 +143,9 @@ orch phase GH-412 implementing
 orch set GH-412 --done-when "..."  # correct intake in place, keeping id and queue slot
 orch approvals                # what's waiting on you
 orch resolve a1234 --decision approved
+orch whoami --agent orchestrator --pane "$HERDR_PANE_ID"   # who handoffs wake
+orch handoffs                 # tasks waiting on the orchestrator
+orch ack GH-412               # handoff picked up
 orch finding add GH-412 --severity P1 --title "..." --where f.py:42
 orch finding list GH-412 --open              # what still blocks the PR
 orch finding resolve f123 --note "what changed"
@@ -192,6 +197,7 @@ Deliberate limits:
 ```
 .claude-plugin/         plugin + marketplace manifests
 lib/store.py            schema, locking, phase rules, board rendering
+lib/notify.py           the one place that shells out to herdr, to wake the orchestrator
 bin/orch                state CLI
 webapp/
   server.py             stdlib HTTP API over the same store
@@ -203,6 +209,7 @@ skills/orchestrate/
     board.md            state/board format
     intake.md           per-tracker fetch adapters
 tests/test_orch_set.py  `orch set` field-editing coverage
+tests/test_handoff.py   handoff wake-ups, review-round counting, the round cap
 install.sh
 ```
 
