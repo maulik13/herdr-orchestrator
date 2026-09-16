@@ -46,6 +46,10 @@ class BoardCase(unittest.TestCase):
     def task(self, key="T-1"):
         return json.loads(self.orch("show", key, "--json").stdout)
 
+    def log(self):
+        with open(os.path.join(self.board, "state.json")) as fh:
+            return json.load(fh)["log"]
+
 
 class TestIntakeFields(BoardCase):
     def test_done_when_alongside_other_flags(self):
@@ -135,7 +139,7 @@ class TestReviewRoundGate(BoardCase):
         """`--review-round 0` stored "0", which is truthy, and opened the gate."""
         self.orch("set", "T-1", "--review-round", "0")
         r = self.orch("phase", "T-1", "pr-open", expect=1)
-        self.assertIn("has had no review round", r.stderr)
+        self.assertIn("no review round recorded", r.stderr)
         self.assertEqual(self.task()["phase"], "queued")
 
     def test_stored_as_int_not_string(self):
@@ -280,6 +284,154 @@ class TestStoreLayer(unittest.TestCase):
                 store.update_task(st, "t1", {"branch": "b", "title": bad})
         self.assertIsNone(st["tasks"][0].get("branch"))   # companion not written
 
+
+class TestGateRefusalsNameTrueRemedies(BoardCase):
+    """op-4: every escape a refusal names has to be one that actually works.
+
+    Both `pr-open` gates used to name a remedy that misrecorded what happened —
+    A offered only `--trivial` and `--force` for a review that ran outside orch,
+    and B offered `dispute`, which it counts as blocking.
+    """
+
+    def gate_a(self):
+        return self.orch("phase", "T-1", "pr-open", expect=1).stderr
+
+    def gate_b(self):
+        self.orch("set", "T-1", "--review-round", "1")
+        self.orch("finding", "add", "T-1", "--severity", "P1", "--title", "leak")
+        return self.orch("phase", "T-1", "pr-open", expect=1).stderr
+
+    def finding_id(self):
+        return json.loads(self.orch("finding", "list", "T-1", "--json").stdout)[0]["id"]
+
+    def test_gate_a_names_review_round(self):
+        """The whole point: the honest remedy is discoverable from the refusal."""
+        err = self.gate_a()
+        self.assertIn("--review-round", err)
+        self.assertIn("--trivial", err)
+        self.assertIn("--force", err)
+        self.assertIn("needs-review", err)        # running the reviewer is still an option
+
+    def test_gate_a_offers_the_reviewer_before_recording_a_round(self):
+        """Ordering is the anti-fabrication measure. `--review-round` is the one
+        flag that could walk unreviewed work through, so it sits under its
+        condition and never reads as the first thing to reach for."""
+        err = self.gate_a()
+        self.assertLess(err.index("needs-review"), err.index("--review-round"))
+        self.assertIn("reviewed outside orch", err)
+
+    def test_gate_a_does_not_present_the_escapes_as_interchangeable(self):
+        """Each line is a claim about what happened, and each lands in the log."""
+        err = self.gate_a()
+        self.assertIn("claim about what happened", err)
+        self.assertIn("recorded as an override, not as a review", err)
+
+    def test_gate_b_never_suggests_disputing(self):
+        """`blocking_open` counts disputed, so the old advice returned the
+        identical refusal — a remedy that cannot work, costing a round trip."""
+        err = self.gate_b()
+        self.assertNotIn("dispute <id>", err)
+        self.assertNotIn("resolve|dispute", err)
+        self.assertIn("a disputed blocker still blocks", err)
+
+    def test_gate_b_names_what_actually_clears_a_blocker(self):
+        err = self.gate_b()
+        for remedy in ("orch finding resolve", "orch finding accept",
+                       "--kind conflict", "--force"):
+            self.assertIn(remedy, err)
+
+    def test_disputing_really_does_not_clear_gate_b(self):
+        """The claim the message now makes, pinned against the store."""
+        self.gate_b()
+        self.orch("finding", "dispute", self.finding_id(), "--note", "out of scope")
+        err = self.orch("phase", "T-1", "pr-open", expect=1).stderr
+        self.assertIn("unresolved blocking finding", err)
+        self.assertEqual(self.task()["phase"], "queued")
+
+    def test_resolving_does_clear_gate_b(self):
+        self.gate_b()
+        self.orch("finding", "resolve", self.finding_id(), "--note", "fixed")
+        self.orch("phase", "T-1", "pr-open")
+        self.assertEqual(self.task()["phase"], "pr-open")
+
+    def test_accepting_a_dispute_clears_gate_b(self):
+        """The route the refusal points a stuck worker at, end to end."""
+        self.gate_b()
+        fid = self.finding_id()
+        self.orch("finding", "dispute", fid, "--note", "pre-existing")
+        self.orch("finding", "accept", fid, "--note", "fair, withdrawn")
+        self.orch("phase", "T-1", "pr-open")
+        self.assertEqual(self.task()["phase"], "pr-open")
+
+    def test_trivial_is_distinguishable_from_no_trivial_in_the_log(self):
+        """The refusal calls `--trivial` "a judgement about the work, recorded
+        as one". Both writes used to log the same line, so the log could not
+        tell asserting that judgement from retracting it."""
+        self.orch("set", "T-1", "--trivial")
+        self.orch("set", "T-1", "--no-trivial")
+        lines = [x for x in self.log() if "set trivial" in x]
+        self.assertTrue(any("trivial=True" in x for x in lines), lines)
+        self.assertTrue(any("trivial=False" in x for x in lines), lines)
+
+    def test_review_round_value_is_recorded_in_the_log(self):
+        """`--review-round 3` asserts three rounds happened. A log line saying
+        only "set review_round" leaves that claim unauditable."""
+        self.orch("set", "T-1", "--review-round", "3")
+        lines = self.log()
+        self.assertTrue(any("set review_round=3" in x for x in lines), lines[-3:])
+
+    def test_other_fields_still_log_by_name_only(self):
+        """Values are logged for the counts a gate reads, not for free text."""
+        self.orch("set", "T-1", "--note", "some long note")
+        lines = self.log()
+        self.assertTrue(any(x.endswith("set note") for x in lines), lines[-3:])
+
+
+class TestForcedOverridesAreRecorded(BoardCase):
+    """Both refusals call `--force` "recorded as an override". It has to be.
+
+    A forced transition used to log `T-1 queued -> pr-open`, byte-identical to a
+    legitimate one, leaving the override recoverable only by cross-reading state
+    — the reconstruction the log exists to spare anyone.
+    """
+
+    def forced(self):
+        return [x for x in self.log() if "FORCED" in x]
+
+    def test_forcing_past_the_no_round_gate_is_logged(self):
+        self.orch("phase", "T-1", "pr-open", "--force")
+        self.assertEqual(len(self.forced()), 1, self.log())
+        self.assertIn("no review round recorded", self.forced()[0])
+
+    def test_forcing_past_a_blocking_finding_names_it(self):
+        """The record names the same gate the refusal did, down to the finding."""
+        self.orch("set", "T-1", "--review-round", "1")
+        self.orch("finding", "add", "T-1", "--severity", "P1", "--title", "leak")
+        fid = json.loads(self.orch("finding", "list", "T-1", "--json").stdout)[0]["id"]
+        self.orch("phase", "T-1", "pr-open", "--force")
+        self.assertIn("1 blocking finding(s) still open", self.forced()[0])
+        self.assertIn(fid, self.forced()[0])
+
+    def test_forcing_a_third_review_round_is_logged(self):
+        self.orch("set", "T-1", "--review-round", "2")
+        self.orch("phase", "T-1", "reviewing", "--force")
+        self.assertIn("2-round review cap", self.forced()[0])
+
+    def test_a_legitimate_transition_records_no_override(self):
+        """The line has to distinguish, so it must not fire when nothing was
+        overridden — including when --force is passed but no gate stood there."""
+        self.orch("set", "T-1", "--review-round", "1")
+        self.orch("phase", "T-1", "pr-open")
+        self.orch("set", "T-2", "--trivial")
+        self.orch("phase", "T-2", "pr-open", "--force")
+        self.assertEqual(self.forced(), [])
+
+    def test_force_is_still_what_opens_the_gate(self):
+        """Recording the override must not change what the gate enforces."""
+        self.orch("phase", "T-1", "pr-open", expect=1)
+        self.assertEqual(self.task()["phase"], "queued")
+        self.orch("phase", "T-1", "pr-open", "--force")
+        self.assertEqual(self.task()["phase"], "pr-open")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

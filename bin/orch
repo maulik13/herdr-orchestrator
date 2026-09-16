@@ -12,7 +12,8 @@ locking, schema validation and board.md regeneration happen in one place.
   orch phase TASK PHASE [--note N] [--force]
   orch set TASK --field VALUE ...      intake:   title, done-when, url, source
                                        plumbing: branch, workspace, pane, worktree,
-                                                 pr-url, pr-state, reviewer, note,
+                                                 pr-url, pr-state, reviewer, note
+                                       review gate (what `phase pr-open` reads):
                                                  review-round, trivial/no-trivial
   orch finding add TASK --severity P1 --title T [--where f:line] [--detail D] [--source AGENT]
   orch finding list TASK [--open] [--blocking]

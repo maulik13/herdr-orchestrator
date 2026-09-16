@@ -70,13 +70,16 @@ order within that section — so `implementing` reads before `planning`, and ope
 PRs sort last in review because they are yours to merge rather than an agent's
 to finish. The webapp renders from this list rather than from its own copy.
 
-`set_phase` is where the gates live, deliberately rather than in an agent brief:
+`set_phase` is where the gates live, deliberately rather than in an agent brief.
+`gate_against` holds each one in a single place and returns both halves — the
+refusal an agent reads, and the line the log keeps if someone forces past it —
+so the record cannot name a different gate from the refusal:
 
 | Gate | Refuses when | Escape |
 |---|---|---|
 | review rounds | entering `reviewing` for a 3rd round | `--force`, or escalate as a `conflict` |
-| PR gate | entering `pr-open` with no review round and not `trivial` | `orch set --trivial`, or `--force` |
-| PR gate | entering `pr-open` with any open or disputed P1/P2 | resolve/dispute each, or `--force` |
+| PR gate | entering `pr-open` with no review round and not `trivial` | `orch set --review-round N` for a review that ran outside orch, `orch set --trivial`, or `--force` |
+| PR gate | entering `pr-open` with any open or disputed P1/P2 | resolve each, reviewer `accept`s a dispute, escalate as `conflict`, or `--force` |
 
 The WIP cap is the one rule enforced a level up, in `bin/orch`: `can_start`
 counts `ACTIVE_PHASES` against `max_active`, and the `phase` command refuses to
@@ -85,7 +88,21 @@ the cap rather than enforcing it (`n / max active`, flagged when full), which
 leaves a drag past it as a human call.
 
 Every refusal names the exact command that would resolve it — these are read by
-agents, and an error that only says *no* costs a round trip.
+agents, and an error that only says *no* costs a round trip. The PR-gate refusals
+go further and list every escape as a *claim about what happened* rather than a
+menu of preferences, because each one lands in the board log: `--review-round`
+asserts a review ran outside orch, `--trivial` asserts a human judged the work
+trivial, `--force` asserts neither and overrides anyway. Naming only a subset
+does not make a gate stricter — it steers agents into the remedy that misrecords
+what happened. For the same reason the findings refusal does not offer `dispute`:
+`blocking_open` counts disputed, so disputing returns the identical refusal.
+
+`--force` earns that claim the same way the other two do: a forced transition
+logs `<KEY> FORCED past <the gate>`, naming the gate and, for a blocking
+finding, the finding. Without it a forced transition reads in the log exactly
+like a legitimate one and the override is recoverable only by cross-reading
+state — which is the reconstruction the log exists to spare anyone. Nothing is
+logged when `--force` is passed where no gate stood.
 
 A review round counts as done when the reviewer **hands work back**
 (`reviewing → resolving`), not when one is started: a reviewer that dies
