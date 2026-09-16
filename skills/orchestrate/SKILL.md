@@ -77,6 +77,8 @@ For every task in an active phase, compare its recorded worker against live stat
 
 Workers move their own phase as they go, so a task sitting in an active phase with no live agent is the case that actually needs you.
 
+One exception to the `name absent` row: a task whose note reads `brief not delivered` has a worker that died before it was ever briefed, usually on a dialog. Its worktree is intact, so it is recovered in place rather than parked — see [A first spawn that lands on a dialog](#a-first-spawn-that-lands-on-a-dialog).
+
 Correct any drift with `orch phase <task> <phase> --note "<what you found>"`, then give the user a short spoken summary: how many active, how many awaiting them, and the single most useful next action. Lead with pending approvals and anything orphaned — those are the rows where the user is the bottleneck.
 
 If `orch list` reports no tasks, say so plainly and treat the request as fresh intake.
@@ -140,9 +142,63 @@ orch phase GH-412 planning
 
 Record before the work finishes, not after. A worker that exists but is unrecorded is a worker you lose when the context clears.
 
-Keep `--no-focus` throughout; the user's focus stays where they put it. `agent start` returns only once Herdr sees the agent ready for input, so a successful return is real readiness — but it needs a pane already at an interactive shell prompt, which is what the worktree step provided.
+Keep `--no-focus` throughout; the user's focus stays where they put it. `agent start` needs a pane already at an interactive shell prompt, which is what the worktree step provided, and it returns once Herdr sees that pane ready for input. That is not the same as the agent being ready for *your brief*: a modal the agent puts up on its own is also a pane waiting for input. A successful return is necessary, not sufficient.
 
-Brief the worker with the implementation template in `references/worker-protocol.md`. Load that file before your first spawn — it carries the full lifecycle, the reviewer brief, and the PR format, and the phases below assume the worker was briefed with it.
+Brief the worker with the implementation template in `references/worker-protocol.md`. Load that file before your first spawn — it carries the full lifecycle, the reviewer brief, and the PR format, and the phases below assume the worker was briefed with it. Send it with `--wait`, not fire-and-forget:
+
+```bash
+herdr agent prompt "$WORKER" "$BRIEF" --wait --timeout 600000
+```
+
+`--wait` is what turns a lost brief into an error you can see. Without it every send looks like it worked, and the first thing you learn is that a worker you believe is planning has been idle since the moment it started.
+
+### A first spawn that lands on a dialog
+
+Claude Code asks once per repository whether the project is trusted, and records the answer against the **main repo root** — not the worktree path. A worktree inherits it, so the question appears only on a first spawn into a newly registered project, and never again for that repo. It is rare, and a human clears it in seconds.
+
+What costs you is the shape of the failure, not the dialog. Herdr sees a pane waiting for input and reports the agent ready; your brief goes into the dialog rather than the agent, is swallowed, and the process exits — taking the agent's name binding with it. By then the board says the worker is fine.
+
+Symptoms, cheapest first:
+
+- the `--wait` prompt above failed or timed out
+- `herdr agent get "$WORKER"` no longer finds the name you just started
+- one `herdr agent read "$PANE_ID" --lines 40` shows the trust question
+
+**The dialog is a question for the human, not for you.** Raise it and stop there:
+
+```bash
+orch approve-request GH-412 --kind question \
+  --title "Claude Code is asking whether <repo> is trusted" --body "<the prompt, quoted>"
+orch set GH-412 --note "brief not delivered"
+orch phase GH-412 awaiting-decision
+```
+
+Never answer it, never send keys to dismiss it, and never pick the obvious-looking option — the same rule as any blocked agent. Trusting a repository is a standing decision covering every agent that will ever run there, and it is not yours to make. `awaiting-decision` is the phase that puts the task on `orch resumable`, so you are told when the human has answered rather than having to remember.
+
+The `brief not delivered` note is doing real work. In the resume table above, a task in an active phase whose agent name is absent reads as "worker gone" and would have you park it. That note is what distinguishes the two cases: this worker never received its brief, so it is recoverable in place.
+
+**Recovering, once the human has cleared the dialog.** Nothing needs recreating. The worktree, workspace, pane and branch are already recorded, and the issue is on the board in full — so reuse them. Do not run `worktree create` again and do not re-add the task: a second worktree strands the first and costs another queue slot, which is the expensive mistake here.
+
+```bash
+REC=$(orch show api/GH-412 --json)
+PANE_ID=$(jq -r '.pane'   <<<"$REC")
+WORKER=$(jq -r '.worker'  <<<"$REC")
+KIND=$(jq -r '.kind'      <<<"$REC")
+herdr agent start "$WORKER" --kind "$KIND" --pane "$PANE_ID"
+herdr agent get "$WORKER"     # the name died with the old process; confirm it is bound again
+```
+
+Confirm the name before briefing, because re-binding it is the step that was done by hand last time this happened. If `agent get` cannot find it, `herdr agent rename "$PANE_ID" "$WORKER"` sets it, and a brief sent to a name nothing answers to is a second lost brief.
+
+Then rebuild the brief from that same record — it carries the key, title, `done_when`, url, branch and worktree, which is every field the template needs — and send it with `--wait` as above. Only once it lands, clear the marker and put the task back where it belongs:
+
+```bash
+orch set GH-412 --note ""
+orch phase GH-412 planning
+orch ack GH-412
+```
+
+None of this is specific to trust. Any modal an agent raises before its first prompt fails the same way, because `agent start` cannot tell one from a shell waiting for input; the trust dialog is just the one that shows up reliably. That limitation is Herdr's, not something this skill can fix — the procedure above is recovery, not a cure.
 
 ## Drive the lifecycle
 
