@@ -460,6 +460,10 @@ REQUIRED_FIELDS = ("title",)
 # on disk is the type the gate expects.
 INT_FIELDS = ("review_round",)
 
+# The fields the `pr-open` gate reads. Setting one is a claim about what
+# happened to the work, so `update_task` logs the value and not just the name.
+GATE_FIELDS = ("review_round", "trivial")
+
 
 def as_count(field, v):
     """Parse a whole number, zero or more. Raises ValueError on anything else.
@@ -521,27 +525,33 @@ def update_task(state, tid, updates):
 
     t.update(clean)
     t["updated"] = now()
-    # Name the field, and for the counts a gate reads, the value too:
-    # `--review-round 3` is a claim that three rounds happened, and a log line
-    # saying only "set review_round" leaves that claim unauditable afterwards.
-    written = ["%s=%s" % (k, clean[k]) if k in INT_FIELDS else k for k in sorted(clean)]
+    # Name the field, and for the two fields the pr-open gate reads, the value
+    # too: `--review-round 3` claims three rounds happened and `--trivial`
+    # claims a human judged the work trivial, so a log line saying only "set
+    # review_round" or "set trivial" — the latter identical to the line
+    # `--no-trivial` writes — leaves the claim unauditable afterwards.
+    written = ["%s=%s" % (k, clean[k]) if k in GATE_FIELDS else k for k in sorted(clean)]
     log(state, "%s set %s" % (t["key"], ", ".join(written)))
     return t
 
 
-def set_phase(state, tid, phase, note=None, force=False):
-    if phase not in PHASES:
-        raise ValueError("unknown phase %r; expected one of %s" % (phase, ", ".join(PHASES)))
-    t = find(state, tid)
-    if not t:
-        raise KeyError("no task %r" % tid)
+def gate_against(state, t, phase):
+    """The gate standing in the way of this transition, or None.
 
+    Returns `(record, refusal)` — the one line the board log keeps if someone
+    forces past it, and the message they read if they do not. Both come from
+    here rather than from two places, because `--force` is only honestly
+    "recorded as an override" if the record names the same gate the refusal
+    did, and a second copy of these conditions would drift from the first.
+    """
     # The two-round cap, enforced here rather than left to the orchestrator
     # remembering. Its memory is the one thing designed to be cleared, and a
     # cap that evaporates on /clear is not a cap. Implementer and reviewer can
     # disagree indefinitely, and each round costs real tokens for less return.
-    if phase == "reviewing" and not force and review_rounds(t) >= MAX_REVIEW_ROUNDS:
-        raise ValueError(
+    if phase == "reviewing" and review_rounds(t) >= MAX_REVIEW_ROUNDS:
+        return (
+            "the %d-round review cap (%d rounds already)"
+            % (MAX_REVIEW_ROUNDS, review_rounds(t)),
             "%s has already had %d review rounds. Anything still disputed is the "
             "conflict — escalate it with `orch finding list %s --open --blocking` and "
             "`orch approve-request %s --kind conflict`, or "
@@ -553,17 +563,18 @@ def set_phase(state, tid, phase, note=None, force=False):
     # Three sanctioned routes past it: the round is recorded (including one that
     # ran outside orch), the task was marked trivial at intake, or a human passed
     # --force. All three are recorded; silently skipping review is not.
-    if phase == "pr-open" and not force and not t.get("trivial"):
+    if phase == "pr-open" and not t.get("trivial"):
         if not review_rounds(t):
-            # Every line here is a claim about what happened, and the board keeps
-            # it, so the menu is written as facts to pick between rather than
-            # options to prefer. `--review-round` is the honest remedy when a
-            # review ran somewhere this board never saw — omitting it pushed
-            # agents towards `--trivial` (a human judgement nobody made) or
-            # `--force` (an override of a gate that was right to block). It sits
-            # under its condition and never first, because it is also the one
-            # flag that could walk genuinely unreviewed work through.
-            raise ValueError(
+            # Every line in the refusal is a claim about what happened, and the
+            # board keeps it, so the menu is written as facts to pick between
+            # rather than options to prefer. `--review-round` is the honest
+            # remedy when a review ran somewhere this board never saw — omitting
+            # it pushed agents towards `--trivial` (a human judgement nobody
+            # made) or `--force` (an override of a gate that was right to
+            # block). It sits under its condition and never first, because it is
+            # also the one flag that could walk genuinely unreviewed work through.
+            return (
+                "the review gate: no review round recorded and not marked trivial",
                 "%s has no review round recorded and is not marked trivial.\n"
                 "Each way past this gate is a claim about what happened, and each is "
                 "recorded — pick the true one:\n"
@@ -579,11 +590,14 @@ def set_phase(state, tid, phase, note=None, force=False):
         # with, which is what REVIEW.md could never answer mechanically.
         blockers = blocking_open(state, t["id"])
         if blockers:
+            named = ", ".join("%s %s" % (f["id"], f["severity"]) for f in blockers)
             # `blocking_open` counts `disputed`, so telling anyone to dispute
             # their way past this returned the identical refusal and cost a
             # round trip. Disputing is a position, not a dismissal: what clears
             # a dispute is the reviewer accepting it, or the human settling it.
-            raise ValueError(
+            return (
+                "the review gate: %d blocking finding(s) still open (%s)"
+                % (len(blockers), named),
                 "%s has %d unresolved blocking finding(s): %s.\n"
                 "Disputing does not clear them — a disputed blocker still blocks, by "
                 "design. What does:\n"
@@ -594,9 +608,20 @@ def set_phase(state, tid, phase, note=None, force=False):
                 "--title \"...\"`\n"
                 "  none of the above   `orch phase %s pr-open --force` — recorded as "
                 "an override, not as a review"
-                % (t["key"], len(blockers),
-                   ", ".join("%s %s" % (f["id"], f["severity"]) for f in blockers),
-                   t["key"], t["key"]))
+                % (t["key"], len(blockers), named, t["key"], t["key"]))
+    return None
+
+
+def set_phase(state, tid, phase, note=None, force=False):
+    if phase not in PHASES:
+        raise ValueError("unknown phase %r; expected one of %s" % (phase, ", ".join(PHASES)))
+    t = find(state, tid)
+    if not t:
+        raise KeyError("no task %r" % tid)
+
+    gate = gate_against(state, t, phase)
+    if gate and not force:
+        raise ValueError(gate[1])
 
     old = t["phase"]
     t["phase"] = phase
@@ -604,6 +629,13 @@ def set_phase(state, tid, phase, note=None, force=False):
     if note:
         t["note"] = note
     log(state, "%s %s -> %s%s" % (t["key"], old, phase, (": " + note) if note else ""))
+
+    # The refusal calls `--force` "recorded as an override"; this line is the
+    # record. Without it a forced transition is byte-identical in the log to a
+    # legitimate one, and the override is only recoverable by cross-reading
+    # state afterwards — the reconstruction the log exists to spare anyone.
+    if gate:
+        log(state, "%s FORCED past %s" % (t["key"], gate[0]))
 
     # A round counts as done when the reviewer hands it back, not when one is
     # started: a reviewer that dies mid-round must not satisfy the `pr-open`

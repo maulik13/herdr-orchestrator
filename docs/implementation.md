@@ -70,7 +70,10 @@ order within that section — so `implementing` reads before `planning`, and ope
 PRs sort last in review because they are yours to merge rather than an agent's
 to finish. The webapp renders from this list rather than from its own copy.
 
-`set_phase` is where the gates live, deliberately rather than in an agent brief:
+`set_phase` is where the gates live, deliberately rather than in an agent brief.
+`gate_against` holds each one in a single place and returns both halves — the
+refusal an agent reads, and the line the log keeps if someone forces past it —
+so the record cannot name a different gate from the refusal:
 
 | Gate | Refuses when | Escape |
 |---|---|---|
@@ -93,6 +96,13 @@ trivial, `--force` asserts neither and overrides anyway. Naming only a subset
 does not make a gate stricter — it steers agents into the remedy that misrecords
 what happened. For the same reason the findings refusal does not offer `dispute`:
 `blocking_open` counts disputed, so disputing returns the identical refusal.
+
+`--force` earns that claim the same way the other two do: a forced transition
+logs `<KEY> FORCED past <the gate>`, naming the gate and, for a blocking
+finding, the finding. Without it a forced transition reads in the log exactly
+like a legitimate one and the override is recoverable only by cross-reading
+state — which is the reconstruction the log exists to spare anyone. Nothing is
+logged when `--force` is passed where no gate stood.
 
 A review round counts as done when the reviewer **hands work back**
 (`reviewing → resolving`), not when one is started: a reviewer that dies
