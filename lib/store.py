@@ -521,7 +521,11 @@ def update_task(state, tid, updates):
 
     t.update(clean)
     t["updated"] = now()
-    log(state, "%s set %s" % (t["key"], ", ".join(sorted(clean))))
+    # Name the field, and for the counts a gate reads, the value too:
+    # `--review-round 3` is a claim that three rounds happened, and a log line
+    # saying only "set review_round" leaves that claim unauditable afterwards.
+    written = ["%s=%s" % (k, clean[k]) if k in INT_FIELDS else k for k in sorted(clean)]
+    log(state, "%s set %s" % (t["key"], ", ".join(written)))
     return t
 
 
@@ -546,26 +550,53 @@ def set_phase(state, tid, phase, note=None, force=False):
 
     # Opening a PR is the point of no return for unreviewed code, so the review
     # gate is enforced here rather than left to an agent remembering a brief.
-    # Two sanctioned escapes: the task was marked trivial at intake, or a human
-    # passed --force. Both are recorded; silently skipping review is not.
+    # Three sanctioned routes past it: the round is recorded (including one that
+    # ran outside orch), the task was marked trivial at intake, or a human passed
+    # --force. All three are recorded; silently skipping review is not.
     if phase == "pr-open" and not force and not t.get("trivial"):
         if not review_rounds(t):
+            # Every line here is a claim about what happened, and the board keeps
+            # it, so the menu is written as facts to pick between rather than
+            # options to prefer. `--review-round` is the honest remedy when a
+            # review ran somewhere this board never saw — omitting it pushed
+            # agents towards `--trivial` (a human judgement nobody made) or
+            # `--force` (an override of a gate that was right to block). It sits
+            # under its condition and never first, because it is also the one
+            # flag that could walk genuinely unreviewed work through.
             raise ValueError(
-                "%s has had no review round and is not marked trivial. "
-                "Run the reviewer, or `orch set %s --trivial` if this genuinely does "
-                "not need one, or `orch phase %s pr-open --force` to override."
-                % (t["key"], t["key"], t["key"]))
+                "%s has no review round recorded and is not marked trivial.\n"
+                "Each way past this gate is a claim about what happened, and each is "
+                "recorded — pick the true one:\n"
+                "  not reviewed yet         run the reviewer: `orch phase %s needs-review`\n"
+                "  reviewed outside orch    `orch set %s --review-round N` — N = rounds "
+                "that actually ran\n"
+                "  does not merit a review  `orch set %s --trivial` — a judgement about "
+                "the work, recorded as one\n"
+                "  none of the above        `orch phase %s pr-open --force` — recorded as "
+                "an override, not as a review"
+                % (t["key"], t["key"], t["key"], t["key"], t["key"]))
         # A round having happened is not the same as its findings being dealt
         # with, which is what REVIEW.md could never answer mechanically.
         blockers = blocking_open(state, t["id"])
         if blockers:
+            # `blocking_open` counts `disputed`, so telling anyone to dispute
+            # their way past this returned the identical refusal and cost a
+            # round trip. Disputing is a position, not a dismissal: what clears
+            # a dispute is the reviewer accepting it, or the human settling it.
             raise ValueError(
-                "%s has %d unresolved blocking finding(s): %s. Resolve or dispute "
-                "each with `orch finding resolve|dispute <id> --note ...`, or "
-                "`orch phase %s pr-open --force` to override."
+                "%s has %d unresolved blocking finding(s): %s.\n"
+                "Disputing does not clear them — a disputed blocker still blocks, by "
+                "design. What does:\n"
+                "  you fixed it        `orch finding resolve <id> --note \"what changed\"`\n"
+                "  your dispute stands the reviewer runs `orch finding accept <id>` — "
+                "the reviewer's call, not yours\n"
+                "  you cannot agree    `orch approve-request %s --kind conflict "
+                "--title \"...\"`\n"
+                "  none of the above   `orch phase %s pr-open --force` — recorded as "
+                "an override, not as a review"
                 % (t["key"], len(blockers),
                    ", ".join("%s %s" % (f["id"], f["severity"]) for f in blockers),
-                   t["key"]))
+                   t["key"], t["key"]))
 
     old = t["phase"]
     t["phase"] = phase

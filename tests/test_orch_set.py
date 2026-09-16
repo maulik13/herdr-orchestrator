@@ -135,7 +135,7 @@ class TestReviewRoundGate(BoardCase):
         """`--review-round 0` stored "0", which is truthy, and opened the gate."""
         self.orch("set", "T-1", "--review-round", "0")
         r = self.orch("phase", "T-1", "pr-open", expect=1)
-        self.assertIn("has had no review round", r.stderr)
+        self.assertIn("no review round recorded", r.stderr)
         self.assertEqual(self.task()["phase"], "queued")
 
     def test_stored_as_int_not_string(self):
@@ -279,6 +279,100 @@ class TestStoreLayer(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.update_task(st, "t1", {"branch": "b", "title": bad})
         self.assertIsNone(st["tasks"][0].get("branch"))   # companion not written
+
+
+class TestGateRefusalsNameTrueRemedies(BoardCase):
+    """op-4: every escape a refusal names has to be one that actually works.
+
+    Both `pr-open` gates used to name a remedy that misrecorded what happened —
+    A offered only `--trivial` and `--force` for a review that ran outside orch,
+    and B offered `dispute`, which it counts as blocking.
+    """
+
+    def gate_a(self):
+        return self.orch("phase", "T-1", "pr-open", expect=1).stderr
+
+    def gate_b(self):
+        self.orch("set", "T-1", "--review-round", "1")
+        self.orch("finding", "add", "T-1", "--severity", "P1", "--title", "leak")
+        return self.orch("phase", "T-1", "pr-open", expect=1).stderr
+
+    def finding_id(self):
+        return json.loads(self.orch("finding", "list", "T-1", "--json").stdout)[0]["id"]
+
+    def test_gate_a_names_review_round(self):
+        """The whole point: the honest remedy is discoverable from the refusal."""
+        err = self.gate_a()
+        self.assertIn("--review-round", err)
+        self.assertIn("--trivial", err)
+        self.assertIn("--force", err)
+        self.assertIn("needs-review", err)        # running the reviewer is still an option
+
+    def test_gate_a_offers_the_reviewer_before_recording_a_round(self):
+        """Ordering is the anti-fabrication measure. `--review-round` is the one
+        flag that could walk unreviewed work through, so it sits under its
+        condition and never reads as the first thing to reach for."""
+        err = self.gate_a()
+        self.assertLess(err.index("needs-review"), err.index("--review-round"))
+        self.assertIn("reviewed outside orch", err)
+
+    def test_gate_a_does_not_present_the_escapes_as_interchangeable(self):
+        """Each line is a claim about what happened, and each lands in the log."""
+        err = self.gate_a()
+        self.assertIn("claim about what happened", err)
+        self.assertIn("recorded as an override, not as a review", err)
+
+    def test_gate_b_never_suggests_disputing(self):
+        """`blocking_open` counts disputed, so the old advice returned the
+        identical refusal — a remedy that cannot work, costing a round trip."""
+        err = self.gate_b()
+        self.assertNotIn("dispute <id>", err)
+        self.assertNotIn("resolve|dispute", err)
+        self.assertIn("a disputed blocker still blocks", err)
+
+    def test_gate_b_names_what_actually_clears_a_blocker(self):
+        err = self.gate_b()
+        for remedy in ("orch finding resolve", "orch finding accept",
+                       "--kind conflict", "--force"):
+            self.assertIn(remedy, err)
+
+    def test_disputing_really_does_not_clear_gate_b(self):
+        """The claim the message now makes, pinned against the store."""
+        self.gate_b()
+        self.orch("finding", "dispute", self.finding_id(), "--note", "out of scope")
+        err = self.orch("phase", "T-1", "pr-open", expect=1).stderr
+        self.assertIn("unresolved blocking finding", err)
+        self.assertEqual(self.task()["phase"], "queued")
+
+    def test_resolving_does_clear_gate_b(self):
+        self.gate_b()
+        self.orch("finding", "resolve", self.finding_id(), "--note", "fixed")
+        self.orch("phase", "T-1", "pr-open")
+        self.assertEqual(self.task()["phase"], "pr-open")
+
+    def test_accepting_a_dispute_clears_gate_b(self):
+        """The route the refusal points a stuck worker at, end to end."""
+        self.gate_b()
+        fid = self.finding_id()
+        self.orch("finding", "dispute", fid, "--note", "pre-existing")
+        self.orch("finding", "accept", fid, "--note", "fair, withdrawn")
+        self.orch("phase", "T-1", "pr-open")
+        self.assertEqual(self.task()["phase"], "pr-open")
+
+    def test_review_round_value_is_recorded_in_the_log(self):
+        """`--review-round 3` asserts three rounds happened. A log line saying
+        only "set review_round" leaves that claim unauditable."""
+        self.orch("set", "T-1", "--review-round", "3")
+        with open(os.path.join(self.board, "state.json")) as fh:
+            lines = json.load(fh)["log"]
+        self.assertTrue(any("set review_round=3" in x for x in lines), lines[-3:])
+
+    def test_other_fields_still_log_by_name_only(self):
+        """Values are logged for the counts a gate reads, not for free text."""
+        self.orch("set", "T-1", "--note", "some long note")
+        with open(os.path.join(self.board, "state.json")) as fh:
+            lines = json.load(fh)["log"]
+        self.assertTrue(any(x.endswith("set note") for x in lines), lines[-3:])
 
 
 if __name__ == "__main__":
