@@ -2,30 +2,50 @@
 
 The lifecycle every implementation worker follows, and the briefs that carry it.
 
-Two properties make this work. Workers update the board **themselves** via the
-`orch` CLI, so phase changes are recorded at the moment they happen rather than
-whenever the orchestrator next looks — the store's file lock makes concurrent
-writes from workers, the orchestrator and the webapp safe. And **only the
-orchestrator starts agents**. A worker that needs a reviewer asks for one by
-moving to `needs-review`; it never spawns anything itself. That keeps one
+Three properties make this work.
+
+Workers update the board **themselves** via the `orch` CLI, so phase changes are
+recorded at the moment they happen rather than whenever the orchestrator next
+looks — the store's file lock makes concurrent writes from workers, the
+orchestrator and the webapp safe.
+
+**Only the orchestrator starts agents.** A worker that needs a reviewer asks for
+one by moving to `needs-review`; it never spawns anything itself. That keeps one
 spawning authority, keeps the board honest, and stops a confused worker from
 spawning reviewers in a loop.
 
+And **`orch phase` wakes the orchestrator** when the next move is not yours.
+Herdr has no event bus, and the orchestrator is a session with no background
+loop: it runs only when prompted. So an agent that finishes and stops leaves the
+next one asleep, and the pipeline waits on a human noticing. Reporting your
+phase is what sends the wake-up — which is the real reason a phase you don't
+report is a phase nobody sees. You do not send it yourself and there is no extra
+step; `orch phase` does it, and it is recorded on the board even if the prompt
+does not land.
+
 ## Phases
 
-| Phase | Who acts | Exit condition |
-|---|---|---|
-| `queued` | — | a slot frees and the orchestrator starts it |
-| `planning` | worker | plan drafted, or a blocking question raised |
-| `awaiting-plan` | **you** | plan approved or rejected |
-| `implementing` | worker | code complete, tests run |
-| `needs-review` | orchestrator | reviewer agent started |
-| `reviewing` | reviewer | findings written |
-| `resolving` | worker | P1/P2 findings addressed |
-| `awaiting-decision` | **you** | breaking change or review conflict settled |
-| `pr-open` | **you** | PR merged |
-| `merged` | orchestrator | cleanup guards pass |
-| `archived` | — | terminal |
+`↑` marks a phase whose entry wakes the orchestrator, because the agent that
+made the move is not the one who acts next.
+
+| Phase | Who acts | Exit condition | |
+|---|---|---|---|
+| `queued` | — | a slot frees and the orchestrator starts it | |
+| `planning` | worker | plan drafted, or a blocking question raised | |
+| `awaiting-plan` | **you** | plan approved or rejected | ↑ |
+| `implementing` | worker | code complete, tests run | |
+| `needs-review` | orchestrator | reviewer agent started or re-prompted | ↑ |
+| `reviewing` | reviewer | findings written | |
+| `resolving` | worker | P1/P2 findings addressed | ↑ |
+| `awaiting-decision` | **you** | breaking change or review conflict settled | ↑ |
+| `pr-open` | **you** | PR merged | |
+| `merged` | orchestrator | cleanup guards pass | ↑ |
+| `archived` | — | terminal | |
+
+`resolving` carries the `↑` only when the *reviewer* enters it, handing findings
+back to an idle worker. The worker reporting `resolving` while it fixes them is
+the same agent continuing, so nobody needs waking. The store decides this from
+the phase you came from; you do not have to think about it.
 
 Every phase change is one command, run by whoever owns the phase:
 
@@ -104,20 +124,42 @@ WORK IN THIS ORDER:
    The orchestrator will start an independent reviewer against your worktree.
    Do not start one yourself.
 
-7. Address findings. They are on the board, not in a file:
+7. Evaluate findings, then address them. The orchestrator will prompt you when
+   a review lands. They are on the board, not in a file:
 
      orch finding list <KEY> --open
 
-   Fix every P1 and P2, recording what you did on each one — that note is what
-   the reviewer re-reads, so it has to say what changed, not that you agree:
+   Judge each one before you touch any code. The reviewer read your diff with no
+   memory of why you wrote it, which is what makes it useful and also what makes
+   it wrong sometimes. Three questions, in order:
+
+   - **Is it correct?** Check the claim against the code rather than assuming.
+     A reviewer asserting a caller exists is not evidence that it does.
+   - **Is it in scope for this issue?** A real problem your change did not
+     introduce and your done-condition does not cover is not yours to fix here.
+     Say so and file it (`orch suggest`, or tell the orchestrator so it can be
+     triaged) rather than quietly widening the diff — scope creep during review
+     is how a one-file fix becomes unreviewable.
+   - **Is the severity right?** A P1 that is really a P3 blocks a PR for nothing.
+
+   Then act. Fix every P1 and P2 you judged valid and in scope, recording what
+   you did on each — that note is what the reviewer re-reads, so it has to say
+   what changed, not that you agree:
 
      orch finding resolve <id> --note "redacted the env before logging"
 
    Disagree with one? Do not silently skip it and do not just resolve it.
    Dispute it with your reasoning; it keeps blocking until the reviewer accepts
-   or reopens it:
+   or reopens it, and that reasoning is what the human reads if you two cannot
+   agree:
 
      orch finding dispute <id> --note "the caller already redacts this"
+     orch finding dispute <id> --note "real, but pre-existing and outside this
+       issue's done-condition — filed separately"
+
+   Disputing is the honest move for anything you judged wrong or out of scope.
+   It is not conflict avoidance: two rounds in, an open dispute is what
+   escalates to the human with both positions attached.
 
      orch phase <KEY> resolving      # while fixing
      orch phase <KEY> needs-review   # when ready for re-check
@@ -153,11 +195,18 @@ The split that works:
 | | carries |
 |---|---|
 | `orch finding` | the findings themselves — durable, queryable, visible on the board |
+| `orch phase` | the handoff: "this is yours now", recorded and sent for you |
 | `herdr agent prompt` | the nudge: "findings are up, go read them" |
 | `herdr pane report-metadata` | live phase for the Herdr sidebar |
 
 Never paste findings into a prompt. Point at the board and let the other agent
 read them, so one copy exists and the human can see it too.
+
+That applies hardest to the handoff prompt, which you do not write: it carries
+the task key, the phase and a fixed reason, and nothing else. It arrives in the
+orchestrator — the one agent allowed to spawn agents — already shaped like an
+instruction, so relaying a reviewer's or an issue's text through it would be a
+direct line there from anything that read something poisoned.
 
 ## Reviewer brief
 
@@ -207,6 +256,13 @@ up as a P2 costs a round-trip and trains everyone to ignore you.
 Found nothing blocking? File no findings and say so. Then:
   orch phase <KEY> resolving
 
+That phase change is how you hand the work back — it wakes the orchestrator,
+which sends the implementer to read what you filed. Without it you have
+reviewed into a void: your findings sit on the board and the implementer stays
+idle, because nothing else tells it you are done. Move the phase even when you
+found nothing; "reviewed, nothing blocking" is a result the pipeline needs.
+Then stop. Do not prompt the implementer yourself, and stay alive for round two.
+
 RE-REVIEW (later rounds): read what the implementer did with each one —
 `orch finding list <KEY>` shows every response and anything disputed. Re-check
 only P1 and P2. Resolve what is genuinely fixed and reopen what is not:
@@ -219,6 +275,11 @@ only P1 and P2. Resolve what is genuinely fixed and reopen what is not:
 
 Two review rounds, then stop. Implementer and reviewer can disagree
 indefinitely, and each round costs real tokens with diminishing returns.
+
+The store enforces this rather than trusting anyone to count: `orch phase <KEY>
+reviewing` refuses a third round and names the escalation. A round counts when
+the reviewer hands back (`reviewing` → `resolving`), so a reviewer that died
+mid-round has not spent one.
 
 The board makes the disagreement legible rather than buried in prose: anything
 still `disputed` after round two is the conflict, already carrying both sides —

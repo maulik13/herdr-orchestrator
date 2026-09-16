@@ -63,6 +63,41 @@ COLLAPSED_BY_DEFAULT = ["parked", "done"]
 # section header so a shut section still says what it is waiting on.
 YOURS_PHASES = ["awaiting-plan", "awaiting-decision", "pr-open"]
 
+# Transitions where the agent that made the move is NOT the agent that has to
+# act next, so somebody idle has to be woken.
+#
+# Herdr has no event bus: the only way to wake an idle agent is
+# `herdr agent prompt`, which some already-running process must call. The
+# orchestrator is a Claude Code session with no background loop — it runs only
+# when prompted — so any handoff routed through it stalls until a human pokes
+# it. Recording the handoff here, on the one command every agent already runs,
+# is what makes the wake-up automatic rather than a step in a brief that can be
+# forgotten.
+#
+# Keyed on the pair, not the destination, because the destination alone does not
+# say whether the actor changed: `reviewing -> resolving` is the reviewer
+# handing findings back to an idle worker, while `needs-review -> resolving` is
+# that same worker reporting it has started reading them. Only the first needs
+# anyone woken.
+HANDOFF_TRANSITIONS = {
+    ("reviewing", "resolving"):
+        "review round finished — relay the findings to the worker",
+    ("implementing", "needs-review"):
+        "implementation ready — start a reviewer",
+    ("resolving", "needs-review"):
+        "fixes ready — wake the existing reviewer for a re-check",
+    ("planning", "awaiting-plan"):
+        "plan submitted — awaiting the human",
+    ("implementing", "awaiting-plan"):
+        "question raised mid-implementation — awaiting the human",
+    ("pr-open", "merged"):
+        "PR merged — run cleanup-check",
+}
+
+# Every transition into these phases needs the orchestrator regardless of where
+# it came from: a decision request can be raised from any active phase.
+HANDOFF_PHASES = ["awaiting-decision"]
+
 
 def section_of(phase):
     for name, phases in SECTIONS:
@@ -83,6 +118,10 @@ SEVERITIES = ["P1", "P2", "P3"]
 BLOCKING = ["P1", "P2"]          # P3 is advisory and never blocks a PR
 
 APPROVAL_KINDS = ["plan", "breaking-change", "conflict", "question"]
+
+# Review rounds before a disagreement becomes the human's. Counted on the
+# reviewer handing work back, so this is rounds *completed*.
+MAX_REVIEW_ROUNDS = 2
 
 
 def now():
@@ -130,6 +169,11 @@ def resolve_repo(path):
 
 
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+# Herdr's own rule for a live agent name. Validated here so a bad name is
+# refused when it is recorded rather than failing later, at the moment a
+# worker is trying to hand work back.
+AGENT_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 def add_project(state, name, path):
@@ -264,6 +308,8 @@ def _blank():
         "suggestions": [],
         "findings": [],
         "approvals": [],
+        "handoffs": [],
+        "orchestrator": None,
         "log": [],
     }
 
@@ -486,6 +532,18 @@ def set_phase(state, tid, phase, note=None, force=False):
     if not t:
         raise KeyError("no task %r" % tid)
 
+    # The two-round cap, enforced here rather than left to the orchestrator
+    # remembering. Its memory is the one thing designed to be cleared, and a
+    # cap that evaporates on /clear is not a cap. Implementer and reviewer can
+    # disagree indefinitely, and each round costs real tokens for less return.
+    if phase == "reviewing" and not force and review_rounds(t) >= MAX_REVIEW_ROUNDS:
+        raise ValueError(
+            "%s has already had %d review rounds. Anything still disputed is the "
+            "conflict — escalate it with `orch finding list %s --open --blocking` and "
+            "`orch approve-request %s --kind conflict`, or "
+            "`orch phase %s reviewing --force` to buy another round."
+            % (t["key"], review_rounds(t), t["key"], t["key"], t["key"]))
+
     # Opening a PR is the point of no return for unreviewed code, so the review
     # gate is enforced here rather than left to an agent remembering a brief.
     # Two sanctioned escapes: the task was marked trivial at intake, or a human
@@ -515,7 +573,32 @@ def set_phase(state, tid, phase, note=None, force=False):
     if note:
         t["note"] = note
     log(state, "%s %s -> %s%s" % (t["key"], old, phase, (": " + note) if note else ""))
+
+    # A round counts as done when the reviewer hands it back, not when one is
+    # started: a reviewer that dies mid-round must not satisfy the `pr-open`
+    # gate. Nothing incremented this before, so that gate refused every
+    # non-trivial task no matter how thoroughly it had been reviewed.
+    if (old, phase) == ("reviewing", "resolving"):
+        t["review_round"] = review_rounds(t) + 1
+
+    reason = handoff_reason(old, phase)
+    if reason:
+        add_handoff(state, t["id"], phase, reason)
     return t
+
+
+def handoff_reason(old, new):
+    """Why this transition needs the orchestrator, or None if it does not.
+
+    The one place the transition table is consulted, so `set_phase` and the
+    `orch` command that sends the wake-up cannot disagree about whether one is
+    owed.
+    """
+    if old == new:
+        return None
+    if new in HANDOFF_PHASES:
+        return "decision requested — awaiting the human"
+    return HANDOFF_TRANSITIONS.get((old, new))
 
 
 def _norm(t):
@@ -540,7 +623,10 @@ def add_finding(state, tid, severity, title, detail="", where=None, source=None)
         "task": t["id"],
         "key": t["key"],
         "project": t.get("project"),
-        "round": t.get("review_round") or 1,
+        # `review_round` counts rounds handed back, so the one being filed
+        # against is the next one. Reading the field directly would label every
+        # round-two finding as round one.
+        "round": review_rounds(t) + 1,
         "severity": severity,
         "title": title,
         "detail": detail,
@@ -744,6 +830,15 @@ def resolve_approval(state, aid, decision, note=None):
             a["resolved"] = now()
             a["decision_note"] = note
             log(state, "%s %s %s" % (a["key"], a["kind"], decision))
+            # The worker that raised this stopped and ended its turn, and no
+            # agent is present at the moment a human clicks a button — so this
+            # is the one handoff nothing else can record. Skipping it is how a
+            # board full of cleared cards sits behind an idle worker forever.
+            t = find(state, a["task"])
+            if t and t["phase"] in ("awaiting-plan", "awaiting-decision"):
+                add_handoff(state, t["id"], t["phase"],
+                            "%s %s — relay the decision to the worker"
+                            % (a["kind"], decision))
             return a
     raise KeyError("no pending approval %r" % aid)
 
@@ -760,6 +855,110 @@ def task_repo(state, t):
     """Main repo root for a task, from its registered project."""
     p = find_project(state, t.get("project"))
     return p["path"] if p else None
+
+
+def set_orchestrator(state, name=None, pane=None):
+    """Record who to wake when a task needs the orchestrator.
+
+    Written at preflight and kept on the board rather than in the
+    orchestrator's context, because the context is the thing expected to be
+    cleared. A worker that finishes an hour after a `/clear` still has to be
+    able to find out who to ping.
+    """
+    rec = dict(state.get("orchestrator") or {})
+    if name:
+        if not AGENT_RE.match(name):
+            raise ValueError("agent name %r must match %s (herdr's own rule)"
+                             % (name, AGENT_RE.pattern))
+        rec["agent"] = name
+    if pane:
+        rec["pane"] = pane
+    if not rec.get("agent") and not rec.get("pane"):
+        raise ValueError("pass --agent, --pane, or both")
+    rec["updated"] = now()
+    state["orchestrator"] = rec
+    log(state, "orchestrator is %s" % (rec.get("agent") or rec.get("pane")))
+    return rec
+
+
+def orchestrator_target(state):
+    """The `herdr agent prompt` target for the orchestrator, or None.
+
+    Prefers the agent name: herdr names follow the pane occupant and are
+    cleared when it exits, so a stale name fails loudly rather than landing a
+    prompt in whatever now occupies that pane. A pane id is the fallback for an
+    orchestrator that never named itself.
+    """
+    rec = state.get("orchestrator") or {}
+    return rec.get("agent") or rec.get("pane")
+
+
+def add_handoff(state, tid, phase, reason):
+    """Record that a task is waiting on the orchestrator.
+
+    One row per task, updated in place. A worker that bounces
+    needs-review -> resolving -> needs-review should read as one thing needing
+    attention, not three, and the newest reason is the only one still true.
+
+    This ledger is what makes the wake-up survive a failure. The prompt that
+    goes with it is best-effort — the orchestrator may be mid-turn, restarted
+    into a new pane, or simply gone — so the durable record is the board, and
+    `orch handoffs` is what a resuming orchestrator reads to catch up.
+    """
+    t = find(state, tid)
+    if not t:
+        raise KeyError("no task %r" % tid)
+    for h in state.setdefault("handoffs", []):
+        if h["task"] == t["id"] and h["status"] == "pending":
+            h.update(phase=phase, reason=reason, updated=now())
+            h["notified"] = None
+            return h
+    h = {
+        "id": "h%d" % (int(time.time() * 1000) % 100000000),
+        "task": t["id"],
+        "key": t["key"],
+        "project": t.get("project"),
+        "phase": phase,
+        "reason": reason,
+        "status": "pending",
+        "notified": None,     # how the wake-up prompt went, for diagnosis
+        "created": now(),
+        "updated": now(),
+    }
+    state["handoffs"].append(h)
+    return h
+
+
+def pending_handoffs(state, tid=None):
+    """What the orchestrator owes attention to, oldest first."""
+    out = [h for h in state.get("handoffs", []) if h["status"] == "pending"]
+    if tid:
+        t = find(state, tid)
+        out = [h for h in out if t and h["task"] == t["id"]]
+    return sorted(out, key=lambda h: h["created"])
+
+
+def clear_handoff(state, tid):
+    """Mark a task's handoff as picked up. Silent when there is none."""
+    t = find(state, tid)
+    if not t:
+        raise KeyError("no task %r" % tid)
+    done = [h for h in state.get("handoffs", [])
+            if h["task"] == t["id"] and h["status"] == "pending"]
+    # Dropped rather than marked: the ledger is a work queue, not an audit
+    # trail, and `log` already carries the phase history that produced it.
+    state["handoffs"] = [h for h in state.get("handoffs", []) if h not in done]
+    return done
+
+
+def record_notify(state, hid, outcome):
+    """Store how the wake-up prompt went, so a dead orchestrator is visible."""
+    for h in state.get("handoffs", []):
+        if h["id"] == hid:
+            h["notified"] = outcome
+            h["updated"] = now()
+            return h
+    return None
 
 
 def resumable(state):
@@ -814,6 +1013,20 @@ def render_board(pdir, state):
     else:
         L.append("_nothing pending_")
     L.append("")
+
+    # Deliberately after "Awaiting you" and before the task tables: an
+    # unclaimed handoff whose prompt failed means the orchestrator is not
+    # listening, and the pipeline is stopped in a way no phase column shows.
+    hand = pending_handoffs(state)
+    if hand:
+        L.append("## Awaiting the orchestrator")
+        L.append("| Project | Key | Phase | Why | Woken | Since |")
+        L.append("|---|---|---|---|---|---|")
+        for h in hand:
+            L.append("| %s | %s | %s | %s | %s | %s |" % (
+                h.get("project") or "-", h["key"], h["phase"], h["reason"],
+                h.get("notified") or "not yet", h["created"][11:16]))
+        L.append("")
 
     for col, phases in SECTIONS:
         rows = [t for t in state["tasks"] if t["phase"] in phases]
