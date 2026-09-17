@@ -230,7 +230,9 @@ class TestWakeupFailureIsVisible(BoardCase):
     def test_handoffs_reports_a_failed_wakeup(self):
         self.drive("planning", "implementing", "needs-review")
         out = self.orch("handoffs").stdout
-        self.assertIn("wake-up did not land", out)
+        # Any outcome that is not a delivered prompt, not just "failed": a
+        # wake-up suppressed as self-directed used to print as a healthy row.
+        self.assertIn("no wake-up reached the orchestrator", out)
 
 
 class TestSelfRaisedHandoffs(BoardCase):

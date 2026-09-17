@@ -70,31 +70,68 @@ def send(target, text):
     return "prompted %s" % target
 
 
-def is_self(state):
+def is_self(state, as_agent=False):
     """Is the caller the orchestrator itself?
 
     It raises its own handoffs — escalating a conflict moves a task to
     `awaiting-decision` — and prompting yourself is a wasted turn that reads
     like someone else asked for something. The ledger row is still recorded;
     only the prompt is skipped.
+
+    Only an agent taking a turn can be the orchestrator, so this answers False
+    unless the caller says otherwise — see `wake` for why that is the default
+    rather than the opt-out.
     """
+    if not as_agent:
+        return False
     pane = os.environ.get("HERDR_PANE_ID")
     rec = state.get("orchestrator") or {}
     return bool(pane and rec.get("pane") == pane)
 
 
-def wake(pdir, handoff):
+def pending(state, tid):
+    """A snapshot of a task's pending handoff, safe to use after the lock.
+
+    One helper rather than the same three lines at every call site: the wake-up
+    has to happen outside the transaction that recorded it, so every caller has
+    to carry a copy across the lock boundary, and a caller that forgets sends
+    nothing and reports nothing.
+    """
+    rows = store.pending_handoffs(state, tid)
+    return dict(rows[0]) if rows else None
+
+
+def wake(pdir, handoff, as_agent=False):
     """Send the wake-up for one recorded handoff and note how it went.
 
     The outcome is written back in its own short transaction, after the prompt,
     so the board lock is never held across the herdr round-trip — the
     orchestrator and every other worker would queue behind it.
+
+    `as_agent=True` means the caller is an agent taking a turn, and so could BE
+    the orchestrator: only then is the self-raise check worth making. `orch`
+    passes it; nothing else should.
+
+    It defaults to off, which is the whole guard. The original bug was the
+    webapp inheriting the orchestrator's `HERDR_PANE_ID` from the pane it was
+    launched in, so every wake-up it sent was dropped as self-directed while
+    the board showed a healthy row. A caller that omits this argument is, by
+    construction, one that never thought about panes — and defaulting it on
+    would suppress that caller's wake-ups in exactly the same silence, because
+    a forgotten keyword and a deliberate self-raise arrive here identical. The
+    two failure directions are not equal: defaulting off can cost the
+    orchestrator a wasted turn prompting itself, defaulting on costs a stalled
+    pipeline nobody is told about.
+
+    The residual risk is a non-agent caller that passes `as_agent=True` by
+    copying `orch`'s call. That is a deliberate claim to be an agent rather
+    than an omission, and nothing here can see through it.
     """
     if not handoff:
         return None
     state = store.read(pdir)
     target = store.orchestrator_target(state)
-    if is_self(state):
+    if is_self(state, as_agent):
         outcome = "queued (raised by the orchestrator itself)"
     elif not target:
         outcome = ("failed: no orchestrator registered "
