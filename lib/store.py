@@ -897,8 +897,16 @@ def resolve_approval(state, aid, decision, note=None):
             # agent is present at the moment a human clicks a button — so this
             # is the one handoff nothing else can record. Skipping it is how a
             # board full of cleared cards sits behind an idle worker forever.
+            #
+            # Gated on YOURS_PHASES rather than a hand-listed pair, because
+            # that constant already means "the phase is the human's move, not
+            # an agent's" — which is exactly when something is parked behind
+            # the card. Listing the phases separately is what left `pr-open`
+            # out: the question card `poll_prs` raises when a PR closes
+            # unmerged was answered and woke nobody, on a task whose worker had
+            # long since ended its turn.
             t = find(state, a["task"])
-            if t and t["phase"] in ("awaiting-plan", "awaiting-decision"):
+            if t and t["phase"] in YOURS_PHASES:
                 add_handoff(state, t["id"], t["phase"],
                             "%s %s — relay the decision to the worker"
                             % (a["kind"], decision))

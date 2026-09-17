@@ -70,6 +70,8 @@ python3 webapp/server.py
 
 Then open http://127.0.0.1:8787. It binds loopback only and has no auth — it drives real agents and exposes repo state, so don't expose it to a network.
 
+**Restart it after a `git pull`.** Every `orch` run re-executes from disk, so a fix reaches the CLI at once; the board is the one long-lived process and keeps serving whatever it loaded at startup. That asymmetry makes a fixed bug look like it only affects the webapp. It prints the commit it is running on startup (`code: 968d1a3`), so you can check rather than guess.
+
 Five collapsible sections stacked top to bottom — in progress, review, queued, parked, done. Each section header doubles as its summary ("2 implementing · 1 awaiting plan … 1 needs you"), so a shut section still reports what it holds. From here you:
 
 - **drag to reorder** the queue, and adjust the WIP cap

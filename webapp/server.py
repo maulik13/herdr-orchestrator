@@ -115,14 +115,14 @@ class Handler(BaseHTTPRequestHandler):
                     old = cur["phase"] if cur else None
                     t = store.set_phase(st, body["task"], body["phase"], body.get("note"))
                     if store.handoff_reason(old, t["phase"]):
-                        handoff = _handoff_for(st, t["id"])
+                        handoff = notify.pending(st, t["id"])
                 elif path == "/api/resolve":
                     # Answering a card is the handoff nothing else can record:
                     # the worker that raised it stopped and ended its turn, and
                     # no agent is present at the moment the button is clicked.
                     a = store.resolve_approval(st, body["approval"], body["decision"],
                                                body.get("note"))
-                    handoff = _handoff_for(st, a["task"])
+                    handoff = notify.pending(st, a["task"])
                 elif path == "/api/project":
                     store.add_project(st, body["name"], body["path"])
                 elif path == "/api/project/update":
@@ -145,20 +145,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": str(e)}, 400)
 
 
-def _handoff_for(st, tid):
-    """A snapshot of the task's pending handoff, safe to use after the lock."""
-    rows = store.pending_handoffs(st, tid)
-    return dict(rows[0]) if rows else None
-
-
 def _wake_later(handoff):
     """Send a handoff's wake-up prompt off the request/poll thread.
 
     Always on a thread, never inline: `notify.wake` reopens the board to record
     the outcome, and this process would block on its own flock.
+
+    `as_agent=False` because this server is not an agent taking a turn. It is
+    normally started from the orchestrator's own pane and inherits that pane's
+    `HERDR_PANE_ID`, which without this makes every wake-up it sends look
+    self-directed and get dropped — the board keeps a healthy-looking pending
+    row and nobody is ever prompted.
     """
     if handoff:
-        threading.Thread(target=notify.wake, args=(PDIR, handoff), daemon=True).start()
+        threading.Thread(target=notify.wake, args=(PDIR, handoff),
+                         kwargs={"as_agent": False}, daemon=True).start()
 
 
 def run_plannotator_gate(approval_id, plan_path):
@@ -202,7 +203,7 @@ def run_plannotator_gate(approval_id, plan_path):
             store.resolve_approval(st, approval_id,
                                    "approved" if decision == "approved" else "rejected",
                                    feedback)
-            handoff = _handoff_for(st, a["task"])
+            handoff = notify.pending(st, a["task"])
         else:
             # dismissed, or the gate failed to start: leave it for the human.
             store.log(st, "%s plan review closed without a decision (%s)"
@@ -265,7 +266,7 @@ def poll_prs(interval):
                 if state == "MERGED":
                     t["pr_state"] = "merged"
                     store.set_phase(st2, tid, "merged", "PR merged; awaiting cleanup")
-                    handoffs.append(_handoff_for(st2, tid))
+                    handoffs.append(notify.pending(st2, tid))
                 else:
                     t["pr_state"] = "closed"
                     store.add_approval(
@@ -274,6 +275,30 @@ def poll_prs(interval):
                         "or what should happen to the branch and worktree." % t.get("pr_url"))
         for h in handoffs:
             _wake_later(h)
+
+
+def loaded_commit():
+    """The commit this process actually loaded, for the startup banner.
+
+    A server is the one long-lived process here: `orch` re-executes from disk
+    every invocation, so a fix reaches the CLI immediately and this instance
+    not at all until someone restarts it. That asymmetry reads exactly like a
+    bug that "only affects the webapp", and it cost a day of looking in the
+    wrong place once already. Printing the commit makes the question
+    answerable without guessing from `ps` start times.
+    """
+    here = os.path.dirname(os.path.realpath(__file__))
+    try:
+        r = subprocess.run(["git", "-C", here, "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return "unknown (not a git checkout)"
+        sha = r.stdout.strip()
+        dirty = subprocess.run(["git", "-C", here, "status", "--porcelain"],
+                               capture_output=True, text=True, timeout=5)
+        return sha + (" +local changes" if dirty.stdout.strip() else "")
+    except Exception:                                       # noqa: BLE001
+        return "unknown"
 
 
 def main():
@@ -296,6 +321,8 @@ def main():
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print("orchestrator board: http://127.0.0.1:%d" % args.port, flush=True)
+    print("code: %s (restart after a `git pull` — this process does not reload)"
+          % loaded_commit(), flush=True)
     print("state: %s" % os.path.join(PDIR, "state.json"), flush=True)
     projs = store.read(PDIR).get("projects", [])
     print("plannotator: %s" % ("available" if HAVE_PLANNOTATOR
