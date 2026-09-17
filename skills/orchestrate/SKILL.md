@@ -251,7 +251,15 @@ You do not run Plannotator — the human does, from the board.
 
 ```bash
 orch resumable          # tasks whose pending decision has been made
+orch show <KEY>         # the decision and its note, for one task
 ```
+
+`orch resumable` lists the phases a task *leaves* once you relay the answer —
+`awaiting-plan` and `awaiting-decision`. A card answered on `pr-open` does not
+move the task (it stays there until the PR merges), so those never appear
+there; `orch show <KEY>` prints the decision and note for any task, and is what
+a handoff row naming a `pr-open` task is pointing you at. The commonest one is
+the question raised when a PR is closed without merging.
 
 For each row, relay the decision and move the phase on:
 

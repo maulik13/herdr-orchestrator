@@ -315,6 +315,80 @@ class TestPrOpenCard(WebappCase):
         for phase in store.YOURS_PHASES:
             self.assertIn(phase, store.PHASES)
 
+    def test_membership_is_pinned_because_it_gates_wakeups(self):
+        """YOURS_PHASES reads like a display constant — it drives the board's
+        "needs you" counts — but it now also decides which resolves prompt the
+        orchestrator. Adding a phase for a cosmetic reason (`merged` is the
+        tempting one) would silently widen that, so the list is pinned exactly
+        and a deliberate change has to come here and say so."""
+        self.assertEqual(store.YOURS_PHASES,
+                         ["awaiting-plan", "awaiting-decision", "pr-open"])
+
+
+class TestPrOpenDecisionIsReadable(WebappCase):
+    """A wake-up has to point at something readable.
+
+    Widening the raise to `pr-open` without this gives the orchestrator a row
+    saying "relay the decision" and nowhere to read the decision from: `orch
+    resumable` is keyed on phases a task LEAVES once the answer is relayed, and
+    a `pr-open` task does not move when its card is answered. A handoff whose
+    decision cannot be read is worse than the silence it replaced — there is
+    now a row to ack and nothing to act on.
+
+    Serving these from `resumable` was the obvious fix and is the wrong one:
+    it is not keyed on anything that clears, so every task that ever reaches
+    `pr-open` would sit in the resume queue permanently, advertising a decision
+    relayed hours ago. `test_resumable_does_not_collect_ordinary_open_prs` is
+    that guard.
+    """
+
+    def answered_card_on_an_open_pr(self, note):
+        for phase in ("planning", "implementing", "needs-review", "reviewing",
+                      "resolving", "pr-open"):
+            self.orch("phase", "T-1", phase)
+        aid = json.loads(self.orch("approve-request", "T-1", "--kind", "question",
+                                   "--title", "PR closed without merging").stdout)["id"]
+        self.orch("resolve", aid, "--decision", "approved", "--note", note)
+
+    def test_orch_show_prints_the_decision_and_its_note(self):
+        self.answered_card_on_an_open_pr("reopen the PR against main")
+        out = self.orch("show", "T-1").stdout
+        self.assertIn("last decision", out)
+        self.assertIn("question approved", out)
+        self.assertIn("reopen the PR against main", out)
+
+    def test_the_handoff_names_the_task_the_note_is_readable_on(self):
+        """The loop has to close: the row names a task, and that task's record
+        carries the answer."""
+        self.answered_card_on_an_open_pr("abandon the branch")
+        row = self.handoffs()[0]
+        self.assertEqual(row["phase"], "pr-open")
+        self.assertIn("abandon the branch", self.orch("show", row["key"]).stdout)
+
+    def test_resumable_does_not_collect_ordinary_open_prs(self):
+        """The guard on the fix that was proposed and rejected. A task whose
+        plan was approved and relayed long ago, now sitting on an open PR, is
+        not waiting on anybody — it must not appear in the resume queue."""
+        self.orch("phase", "T-1", "planning")
+        aid = json.loads(self.orch("approve-request", "T-1", "--kind", "plan",
+                                   "--title", "the approach").stdout)["id"]
+        self.orch("phase", "T-1", "awaiting-plan")
+        self.orch("resolve", aid, "--decision", "approved", "--note", "go")
+        self.orch("ack", "T-1")
+        for phase in ("implementing", "needs-review", "reviewing", "resolving",
+                      "pr-open"):
+            self.orch("phase", "T-1", phase)
+        self.orch("ack", "T-1")
+        self.assertIn("nothing to resume", self.orch("resumable").stdout)
+
+    def test_a_pending_card_still_shows_as_pending_not_as_a_decision(self):
+        """An unanswered card must not read as an answer to relay."""
+        self.orch("phase", "T-1", "planning")
+        self.orch("approve-request", "T-1", "--kind", "plan", "--title", "the approach")
+        out = self.orch("show", "T-1").stdout
+        self.assertIn("pending approval", out)
+        self.assertNotIn("last decision", out)
+
 
 class TestPlannotatorGate(WebappCase):
     """The verdict path settles the approval without anyone touching the board,
@@ -411,13 +485,16 @@ class TestSuppressedWakeupIsVisible(WebappCase):
     somebody looks. Reporting only `failed` was too narrow — "queued" read as
     healthy, which is how this hid."""
 
-    def test_handoffs_reports_a_suppressed_wakeup(self):
+    def test_a_self_raised_row_is_not_reported_as_a_fault(self):
+        """The orchestrator escalating a conflict from its own pane is routine
+        and needs no prompt. Telling it that no wake-up arrived, about a row it
+        just created, reads as a failure where there is none."""
         self.env["HERDR_PANE_ID"] = "wD:p1"
         self.orch("phase", "T-1", "planning")
         self.orch("phase", "T-1", "awaiting-decision")
         out = self.orch("handoffs").stdout
-        self.assertIn("no wake-up reached the orchestrator", out)
-        self.assertIn("orchestrator itself", out)
+        self.assertIn("raised here; no prompt needed", out)
+        self.assertNotIn("no wake-up reached the orchestrator", out)
 
     def test_handoffs_reports_a_failed_wakeup(self):
         self.env["FAKE_HERDR_EXIT"] = "1"

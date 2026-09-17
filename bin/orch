@@ -146,6 +146,14 @@ def cmd_show(args):
     pend = [a for a in store.pending_approvals(st) if a["task"] == t["id"]]
     for a in pend:
         print("\npending approval %s (%s): %s" % (a["id"], a["kind"], a["title"]))
+    # The answer behind a handoff row. `orch resumable` covers the phases a
+    # task leaves once the decision is relayed; a card answered on `pr-open`
+    # does not move the task, so this is where its note is readable.
+    last = store.last_decision(st, t["id"])
+    if last and not pend:
+        print("\nlast decision  %s %s: %s" % (last["kind"], last["status"], last["title"]))
+        if last.get("decision_note"):
+            print("note           %s" % last["decision_note"])
 
 
 def cmd_phase(args):
@@ -407,13 +415,17 @@ def cmd_handoffs(args):
         t = store.find(st, h["task"])
         print("%-12s %-16s %-16s %s" % (h["key"], h["phase"],
                                         (t.get("worker") if t else None) or "-", h["reason"]))
-        # Any outcome that is not a delivered prompt is why this row is still
-        # here, so say so: the fix is usually re-registering after a restart,
-        # not chasing the worker. Reporting only `failed` was too narrow — a
-        # wake-up suppressed as self-directed printed as a healthy row, which
-        # is how a webapp that had never prompted anyone went unnoticed.
+        # Any outcome that is not a delivered prompt gets a line, because
+        # reporting only `failed` was too narrow: a wake-up suppressed as
+        # self-directed printed as a healthy row, which is how a webapp that
+        # had never prompted anyone went unnoticed. The two are not the same
+        # news, though — a handoff the orchestrator raised in its own pane
+        # needed no prompt, and telling it that none arrived reads as a fault
+        # where there is none.
         note = h.get("notified") or ""
-        if note and not note.startswith("prompted"):
+        if note.startswith("queued"):
+            print("%-12s   raised here; no prompt needed" % "")
+        elif note and not note.startswith("prompted"):
             print("%-12s   no wake-up reached the orchestrator: %s" % ("", note))
     print("\n%d waiting — `orch ack <task>` once you have acted" % len(rows))
 

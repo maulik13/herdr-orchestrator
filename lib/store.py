@@ -61,6 +61,13 @@ COLLAPSED_BY_DEFAULT = ["parked", "done"]
 
 # Phases that are the human's move rather than an agent's, surfaced in a
 # section header so a shut section still says what it is waiting on.
+#
+# Not only cosmetic: `resolve_approval` gates the wake-up on this list, because
+# "the phase is the human's move" is exactly "something is parked behind this
+# card". Adding a phase here for a display reason therefore also makes every
+# resolve on that phase prompt the orchestrator — check that is what you want,
+# and `orch show` can read the decision back from it. The membership is pinned
+# by a test so the coupling cannot be widened by accident.
 YOURS_PHASES = ["awaiting-plan", "awaiting-decision", "pr-open"]
 
 # Transitions where the agent that made the move is NOT the agent that has to
@@ -1030,6 +1037,31 @@ def record_notify(state, hid, outcome):
             h["updated"] = now()
             return h
     return None
+
+
+def last_decision(state, tid):
+    """The most recently answered approval on a task, or None.
+
+    `resumable` is the queue of workers waiting on an answer, and it is keyed
+    on phases the task *leaves* once the answer is relayed — which is what
+    makes it self-clearing. A `pr-open` task does not leave its phase when a
+    card is answered (it sits there until the PR merges), so it cannot be
+    served by that queue without every task that reaches `pr-open` sticking in
+    it forever, showing a decision relayed hours ago.
+
+    This is the per-task lookup instead: `orch handoffs` names the task, and
+    this is what `orch show` prints so the decision behind that row is
+    readable. A wake-up pointing at a decision nobody can read is worse than
+    the silence it replaced.
+    """
+    t = find(state, tid)
+    if not t:
+        raise KeyError("no task %r" % tid)
+    done = [a for a in state.get("approvals", [])
+            if a["task"] == t["id"] and a["status"] != "pending"]
+    if not done:
+        return None
+    return sorted(done, key=lambda a: a.get("resolved") or "")[-1]
 
 
 def resumable(state):
