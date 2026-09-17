@@ -547,6 +547,28 @@ class TestForgettingTheKwargIsSafe(WebappCase):
         self.assertEqual(outcome, "prompted orchestrator")
         self.assertTrue(self.prompts(), "a forgetful caller sent nothing")
 
+    def test_the_orchestrator_resolving_its_own_card_does_not_prompt_itself(self):
+        """Pins `as_agent=True` at the `orch resolve` call site.
+
+        The phase call site is pinned several times over; this one was not, so
+        dropping the kwarg here passed every test. The consequence is mild — a
+        wasted turn, not a stall — but an unpinned wake call site is how one
+        gets dropped in a later refactor, which this branch already came close
+        to when five of them were collapsed into `notify.pending`.
+        """
+        self.env["HERDR_PANE_ID"] = "wD:p1"          # the orchestrator's own pane
+        self.orch("phase", "T-1", "planning")
+        aid = json.loads(self.orch("approve-request", "T-1", "--kind", "conflict",
+                                   "--title", "reviewer and worker disagree").stdout)["id"]
+        self.orch("phase", "T-1", "awaiting-decision")
+        self.orch("ack", "T-1")
+        open(self.shim_log, "w").close()
+
+        self.orch("resolve", aid, "--decision", "approved", "--note", "worker is right")
+        self.assertEqual(self.prompts(deadline=1), [],
+                         "the orchestrator prompted itself about its own decision")
+        self.assertIn("orchestrator itself", self.handoffs()[0]["notified"])
+
     def test_an_agent_that_passes_it_still_skips_its_own_pane(self):
         """The guard still holds where it was meant to, via `orch`, which is
         the only caller that is genuinely an agent taking a turn."""
