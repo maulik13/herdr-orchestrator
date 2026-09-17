@@ -381,13 +381,40 @@ class TestPrOpenDecisionIsReadable(WebappCase):
         self.orch("ack", "T-1")
         self.assertIn("nothing to resume", self.orch("resumable").stdout)
 
-    def test_a_pending_card_still_shows_as_pending_not_as_a_decision(self):
-        """An unanswered card must not read as an answer to relay."""
+    def test_a_pending_card_still_shows_as_pending(self):
+        """An unanswered card reads as pending, and a task with no answered
+        card has no decision line at all."""
         self.orch("phase", "T-1", "planning")
         self.orch("approve-request", "T-1", "--kind", "plan", "--title", "the approach")
         out = self.orch("show", "T-1").stdout
         self.assertIn("pending approval", out)
         self.assertNotIn("last decision", out)
+
+    def test_the_note_survives_another_card_being_open(self):
+        """The case that matters most, not an edge case.
+
+        `poll_prs` filters its watch on phase and pr_url but never on
+        pr_state, so a PR closed without merging collects a fresh question
+        card every tick until someone moves the phase. The human answers one
+        of them and the rest stay pending — so "another card is open" is the
+        normal condition on `pr-open`, and it is precisely when the
+        orchestrator has just been woken to relay the answer. Suppressing the
+        decision here restored the original symptom exactly: woken, with the
+        note readable nowhere.
+        """
+        for phase in ("planning", "implementing", "needs-review", "reviewing",
+                      "resolving", "pr-open"):
+            self.orch("phase", "T-1", phase)
+        first = json.loads(self.orch("approve-request", "T-1", "--kind", "question",
+                                     "--title", "PR closed without merging").stdout)["id"]
+        self.orch("approve-request", "T-1", "--kind", "question",
+                  "--title", "PR closed without merging")      # the next tick's card
+        self.orch("resolve", first, "--decision", "rejected",
+                  "--note", "abandon the branch, reopen as a fresh PR")
+        out = self.orch("show", "T-1").stdout
+        self.assertIn("pending approval", out, "the open card is still listed")
+        self.assertIn("last decision", out)
+        self.assertIn("abandon the branch, reopen as a fresh PR", out)
 
 
 class TestPlannotatorGate(WebappCase):
@@ -478,6 +505,56 @@ class TestWebappIsNotAnAgent(WebappCase):
         rows = self.handoffs()
         self.assertEqual(len(rows), 1, "the row is still recorded")
         self.assertIn("orchestrator itself", rows[0]["notified"])
+
+
+class TestForgettingTheKwargIsSafe(WebappCase):
+    """`as_agent` defaults to off, and that default is the guard.
+
+    A forgotten keyword and a deliberate self-raise reach `notify.wake`
+    identical — both with `as_agent` true if it defaulted on — so no reporting
+    split can tell them apart downstream. The fix is that omitting it means
+    "not an agent", which is true of every caller that never thought about
+    panes. The cost of being wrong that way is the orchestrator prompting
+    itself once; the cost of the other way is a stalled pipeline nobody hears
+    about, which is the bug this branch exists to remove.
+    """
+
+    def test_a_caller_that_omits_it_still_wakes_the_orchestrator(self):
+        """The original bug's shape: a non-agent process, holding the
+        orchestrator's pane id, that never passed the argument."""
+        sys.path.insert(0, os.path.join(ROOT, "lib"))
+        import notify                                        # noqa: PLC0415
+        self.orch("phase", "T-1", "planning")
+        self.orch("phase", "T-1", "awaiting-decision")
+        self.orch("ack", "T-1")
+        open(self.shim_log, "w").close()
+
+        with store.transaction(self.board) as st:
+            h = store.add_handoff(st, "T-1", "awaiting-decision", "reason")
+        keep = os.environ.get("HERDR_PANE_ID")
+        os.environ["HERDR_PANE_ID"] = "wD:p1"                 # the registered pane
+        keep_path = os.environ["PATH"]
+        os.environ["PATH"] = self.env["PATH"]
+        os.environ["FAKE_HERDR_LOG"] = self.shim_log
+        try:
+            outcome = notify.wake(self.board, dict(h))        # no as_agent
+        finally:
+            os.environ["PATH"] = keep_path
+            if keep is None:
+                os.environ.pop("HERDR_PANE_ID", None)
+            else:
+                os.environ["HERDR_PANE_ID"] = keep
+        self.assertEqual(outcome, "prompted orchestrator")
+        self.assertTrue(self.prompts(), "a forgetful caller sent nothing")
+
+    def test_an_agent_that_passes_it_still_skips_its_own_pane(self):
+        """The guard still holds where it was meant to, via `orch`, which is
+        the only caller that is genuinely an agent taking a turn."""
+        self.env["HERDR_PANE_ID"] = "wD:p1"
+        self.orch("phase", "T-1", "planning")
+        self.orch("phase", "T-1", "awaiting-decision")
+        self.assertEqual(self.prompts(deadline=1), [])
+        self.assertIn("orchestrator itself", self.handoffs()[0]["notified"])
 
 
 class TestSuppressedWakeupIsVisible(WebappCase):

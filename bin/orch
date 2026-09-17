@@ -150,7 +150,7 @@ def cmd_show(args):
     # task leaves once the decision is relayed; a card answered on `pr-open`
     # does not move the task, so this is where its note is readable.
     last = store.last_decision(st, t["id"])
-    if last and not pend:
+    if last:
         print("\nlast decision  %s %s: %s" % (last["kind"], last["status"], last["title"]))
         if last.get("decision_note"):
             print("note           %s" % last["decision_note"])
@@ -178,7 +178,10 @@ def cmd_phase(args):
     # orchestrator and every other worker behind this one write. The flush
     # above keeps the two lines in order when stdout is a pipe.
     if handoff:
-        print("handoff: %s" % notify.wake(pdir, handoff), file=sys.stderr)
+        # as_agent: `orch` is run BY an agent taking a turn, so it is the one
+        # caller that can be the orchestrator raising its own handoff.
+        print("handoff: %s" % notify.wake(pdir, handoff, as_agent=True),
+              file=sys.stderr)
 
 
 # argparse dests that carry a value, so they can be swept straight out of the
@@ -382,7 +385,10 @@ def cmd_resolve(args):
         handoff = notify.pending(st, a["task"])
     print("%s %s" % (a["key"], a["status"]), flush=True)
     if handoff:
-        print("handoff: %s" % notify.wake(pdir, handoff), file=sys.stderr)
+        # as_agent: `orch` is run BY an agent taking a turn, so it is the one
+        # caller that can be the orchestrator raising its own handoff.
+        print("handoff: %s" % notify.wake(pdir, handoff, as_agent=True),
+              file=sys.stderr)
 
 
 def cmd_whoami(args):
