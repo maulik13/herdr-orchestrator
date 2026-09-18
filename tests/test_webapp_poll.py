@@ -49,7 +49,17 @@ from test_webapp_resolve import WebappCase
 # decide the loop has reacted to a flipped answer is a race, and was one.
 GH_SHIM = """#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_GH_STARTS"
-[ -n "$FAKE_GH_DELAY" ] && sleep "$FAKE_GH_DELAY"
+# A case that needs the round-trip held open creates FAKE_GH_GATE and
+# releases it by touching the file, so the window is opened and closed by
+# the test rather than measured against the clock. Bounded so a bug in the
+# case cannot wedge the run; overshooting it is reported, never silent.
+if [ -n "$FAKE_GH_GATE" ]; then
+  waited=0
+  while [ ! -f "$FAKE_GH_GATE" ] && [ "$waited" -lt 600 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+fi
 # Builtins only past this point — no basename, no cat, no $( ). Every fork
 # here is one the poll loop waits on, once per watched PR per tick, and a
 # developer box under real load (other agents, a virus scanner) is where a
@@ -366,26 +376,40 @@ class TestTheRaceUnderTheLock(PollCase):
     """
 
     def test_a_concurrent_write_during_the_gh_call_still_cards_once(self):
+        gate = os.path.join(self.tmp.name, "release-gh")
         self.park_on_an_open_pr()
         self.says("CLOSED")
-        self.env["FAKE_GH_DELAY"] = "3"        # hold the round-trip open
+        self.env["FAKE_GH_GATE"] = gate        # the call parks until released
         self.serve(poll=1)
-        self.wait_for(lambda: self.starts() >= 1,
-                      "the gh call to begin")   # in flight, not done
+        self.wait_for(lambda: self.starts() >= 1, "the gh call to begin")
 
-        # Someone records the close by hand while `gh` is still answering, so
-        # the snapshot the loop is holding ("open") is now stale.
+        # The call is parked inside the shim, so the loop is holding a snapshot
+        # that still says "open". Record the close while it is stuck there.
+        # Held open by the gate rather than by a timed delay: `orch` is a fresh
+        # interpreter, and on a loaded box interpreter startup is exactly what
+        # overruns a fixed window. Missing it would make tick 1 card
+        # legitimately and report a product bug that is not there.
         self.orch("set", "T-1", "--pr-state", "closed")
+        self.assertEqual(self.ticks(), 0,
+                         "the gh call must still be in flight; the premise of "
+                         "this case is a write that lands during the round-trip")
+
+        open(gate, "w").close()                # let it answer
+        self.wait_for(lambda: self.ticks() >= 1, "the parked gh call to return")
         # A second call STARTING proves the first one's transaction is written:
         # the loop reads, acts, sleeps, reads.
         self.wait_for(lambda: self.starts() >= 2,
-                      "the in-flight call to finish and its transaction to land")
+                      "its transaction to land")
 
         cards = self.cards()
         self.assertEqual(len(cards), 0,
                          "the close was already recorded; the stale snapshot "
                          "must not card again: %s" % [c["id"] for c in cards])
         self.assertEqual(self.task()["pr_state"], "closed")
+        self.assertIn("CLOSED", self.served(),
+                      "the parked call has to have actually answered — a gh "
+                      "call that timed out would raise no card either, and "
+                      "would pass this case for the wrong reason")
 
 
 class TestMergeIsUnconditional(PollCase):
