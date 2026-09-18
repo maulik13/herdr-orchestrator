@@ -128,16 +128,29 @@ class WebappCase(unittest.TestCase):
                                                   r.stdout, r.stderr))
         return r
 
-    def serve(self, pane=None):
-        """Start the board. `pane` sets the HERDR_PANE_ID it inherits."""
+    def serve(self, pane=None, poll=0):
+        """Start the board. `pane` sets the HERDR_PANE_ID it inherits.
+
+        `poll` is the PR poll interval, 0 (off) for everything that is not
+        testing the poll loop itself. A case that turns it on must put a `gh`
+        shim on PATH ahead of the real one — see tests/test_webapp_poll.py —
+        because a live `gh` here would ask GitHub about a made-up PR url.
+        """
         env = dict(self.env)
         if pane:
             env["HERDR_PANE_ID"] = pane
         self.port = free_port()
-        # poll-seconds 0: no `gh` calls, so a test never touches the network.
+        # To a file, not a pipe. Nothing in a test reads the server's output
+        # while it runs, and a pipe nobody drains blocks the process that
+        # fills it; a file is also readable at any moment, which is what lets
+        # a failing wait say what the server was doing instead of only that it
+        # waited.
+        self.server_log = os.path.join(self.tmp.name, "server-%d.log" % self.port)
+        self.server_fh = open(self.server_log, "w")
+        self.addCleanup(self.server_fh.close)
         self.proc = subprocess.Popen(
-            [sys.executable, SERVER, "--port", str(self.port), "--poll-seconds", "0"],
-            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            [sys.executable, SERVER, "--port", str(self.port), "--poll-seconds", str(poll)],
+            env=env, stdout=self.server_fh, stderr=subprocess.STDOUT, text=True)
         self.addCleanup(self.stop)
         deadline = time.time() + 20
         while time.time() < deadline:
@@ -148,9 +161,24 @@ class WebappCase(unittest.TestCase):
                 return
             except Exception:                               # noqa: BLE001
                 if self.proc.poll() is not None:
-                    self.fail("server exited: %s" % self.proc.communicate()[0])
+                    self.fail("server exited: %s" % self.server_output())
                 time.sleep(0.1)
         self.fail("server did not come up")
+
+    def server_output(self):
+        """Everything the server has printed so far, stdout and stderr both.
+
+        A daemon thread that dies takes its traceback here and nowhere else —
+        `poll_prs` would simply stop polling for the life of the process, with
+        the board looking perfectly healthy. Worth reading whenever a wait on
+        the server times out.
+        """
+        try:
+            self.server_fh.flush()
+            with open(self.server_log) as fh:
+                return fh.read().strip() or "(nothing)"
+        except Exception:                                   # noqa: BLE001
+            return "(unavailable)"
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -393,14 +421,20 @@ class TestPrOpenDecisionIsReadable(WebappCase):
     def test_the_note_survives_another_card_being_open(self):
         """The case that matters most, not an edge case.
 
-        `poll_prs` filters its watch on phase and pr_url but never on
-        pr_state, so a PR closed without merging collects a fresh question
-        card every tick until someone moves the phase. The human answers one
-        of them and the rest stay pending — so "another card is open" is the
-        normal condition on `pr-open`, and it is precisely when the
-        orchestrator has just been woken to relay the answer. Suppressing the
-        decision here restored the original symptom exactly: woken, with the
-        note readable nowhere.
+        Two open "PR closed without merging" cards on one task was once the
+        NORMAL condition on `pr-open`: `poll_prs` filtered its watch on phase
+        and pr_url but never on pr_state, so a closed-unmerged PR collected a
+        fresh card every tick until someone moved the phase, and the human
+        answered one of N. or-10 made the loop react to the transition
+        instead, so it now takes a close -> reopen -> close cycle rather than a
+        second tick — rarer, but not gone, and the shape is unchanged.
+
+        Either way this case does not depend on the poll loop: it builds both
+        cards with `orch approve-request` and asserts on `orch show`. What it
+        pins is that a second open card must not hide the decision on the
+        first, which is precisely when the orchestrator has just been woken to
+        relay that answer. Suppressing the decision here restored the original
+        symptom exactly: woken, with the note readable nowhere.
         """
         for phase in ("planning", "implementing", "needs-review", "reviewing",
                       "resolving", "pr-open"):
@@ -618,7 +652,7 @@ class TestStartupBanner(WebappCase):
     def test_it_names_the_commit_and_says_to_restart(self):
         self.serve()
         self.stop()
-        out = self.proc.communicate()[0]
+        out = self.server_output()
         self.assertIn("code:", out)
         self.assertIn("restart after a `git pull`", out)
         sha = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"],

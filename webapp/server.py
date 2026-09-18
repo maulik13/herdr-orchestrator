@@ -221,6 +221,22 @@ def poll_prs(interval):
     deliberately does not clean up: removing worktrees and deleting branches is
     the orchestrator's job, guarded by `orch cleanup-check`. A web request
     thread has no business tearing down a git worktree.
+
+    REACTS TO TRANSITIONS, NOT TO STATE. `pr_state` is the board's record of
+    what GitHub last said, and so is also the record of what this loop has
+    already reacted to. Without that test a closed-unmerged PR raised a fresh
+    question card every tick — one a minute at the default interval — because
+    closing does not move the phase out of `pr-open`, so the next tick saw the
+    same task, asked `gh` again, and got CLOSED again. The human answers one
+    card of N and the rest stay pending as noise.
+
+    That makes `pr_state` load-bearing rather than cosmetic: a hand-run `orch
+    set --pr-state closed` suppresses the card for the next close, and setting
+    it back to `open` re-arms it. It is the right key even so. The alternative
+    — deriving "already carded" from a pending approval — re-raises the moment
+    a human answers, because answering does not move the phase either; and
+    dropping closed tasks from the watch entirely would stop asking `gh` about
+    a PR the human was invited to reopen, so the eventual merge is never seen.
     """
     if not shutil.which("gh"):
         print("gh not found — PR merge polling disabled", flush=True)
@@ -234,7 +250,7 @@ def poll_prs(interval):
         except Exception:
             continue
 
-        watch = [(t["id"], t["pr_url"]) for t in st.get("tasks", [])
+        watch = [(t["id"], t["pr_url"], t.get("pr_state")) for t in st.get("tasks", [])
                  if t.get("phase") == "pr-open" and t.get("pr_url")]
         if not watch:
             continue
@@ -242,14 +258,33 @@ def poll_prs(interval):
         # Every network call happens outside the lock. Holding flock across a
         # `gh` round-trip would stall the orchestrator and every worker.
         found = {}
-        for tid, url in watch:
+        for tid, url, seen in watch:
             try:
                 r = subprocess.run(["gh", "pr", "view", url, "--json", "state,mergedAt"],
                                    capture_output=True, text=True, timeout=20)
                 if r.returncode != 0:
                     continue
                 state = (json.loads(r.stdout).get("state") or "").upper()
-                if state in ("MERGED", "CLOSED"):
+                # A MERGED answer ALWAYS reaches the lock, never filtered. The
+                # in-lock code acts on it before the transition test for the
+                # same reason, and doing it in only one of the two places is
+                # worse than neither: a task put back on `pr-open` after a
+                # merge (an ordinary recovery move — merge reverted, more work
+                # needed) still carries pr_state="merged", so filtering here
+                # drops it before the lock, nothing ever rewrites pr_state, and
+                # the loop goes permanently blind to that PR. A missed close is
+                # loud; a missed merge is silent and never self-heals.
+                #
+                # CLOSED and OPEN are filtered against the snapshot, because an
+                # ordinary open PR is the steady state here and taking the
+                # board lock every tick to rewrite `open` over `open` would put
+                # the orchestrator and every worker behind this thread's flock
+                # for nothing. Compared case-insensitively: `pr_state` is set
+                # by hand often enough that "CLOSED" as `gh` prints it is a
+                # real value on real boards, and the suppress/re-arm escape
+                # hatch should not turn on capitalisation.
+                if state == "MERGED" or (state in ("CLOSED", "OPEN")
+                                         and state != (seen or "").upper()):
                     found[tid] = state
             except Exception:
                 continue  # transient network/auth trouble; try again next tick
@@ -267,12 +302,35 @@ def poll_prs(interval):
                     t["pr_state"] = "merged"
                     store.set_phase(st2, tid, "merged", "PR merged; awaiting cleanup")
                     handoffs.append(notify.pending(st2, tid))
-                else:
+                    continue
+                # Re-read under the lock, not against the pre-`gh` snapshot:
+                # a human or an `orch set` may have moved `pr_state` during the
+                # round-trip, and acting on the stale copy is how the duplicate
+                # card comes back under a race.
+                if (t.get("pr_state") or "").upper() == state:
+                    continue          # already reacted to this state
+                if state == "CLOSED":
                     t["pr_state"] = "closed"
                     store.add_approval(
                         st2, tid, "question", "PR closed without merging",
                         "%s was closed but never merged. Decide whether to reopen it, "
                         "or what should happen to the branch and worktree." % t.get("pr_url"))
+                else:
+                    # Recording the open state is what keeps `pr_state` honest,
+                    # so a PR closed a second time is a new decision and cards
+                    # again. No card and no wake-up either way.
+                    #
+                    # Only a close -> open move is a reopen worth logging. The
+                    # branch is also reached with nothing to say: `pr_state`
+                    # starts null and `orch set --pr-url` alone leaves it that
+                    # way, and a task back on `pr-open` after a merge arrives
+                    # here carrying "merged". Logging those as a reopen writes
+                    # an event that never happened into the one record a human
+                    # reads to reconstruct what became of a PR.
+                    was = (t.get("pr_state") or "").upper()
+                    t["pr_state"] = "open"
+                    if was == "CLOSED":
+                        store.log(st2, "%s PR reopened" % t["key"])
         for h in handoffs:
             _wake_later(h)
 
