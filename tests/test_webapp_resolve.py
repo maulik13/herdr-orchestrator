@@ -398,14 +398,20 @@ class TestPrOpenDecisionIsReadable(WebappCase):
     def test_the_note_survives_another_card_being_open(self):
         """The case that matters most, not an edge case.
 
-        `poll_prs` filters its watch on phase and pr_url but never on
-        pr_state, so a PR closed without merging collects a fresh question
-        card every tick until someone moves the phase. The human answers one
-        of them and the rest stay pending — so "another card is open" is the
-        normal condition on `pr-open`, and it is precisely when the
-        orchestrator has just been woken to relay the answer. Suppressing the
-        decision here restored the original symptom exactly: woken, with the
-        note readable nowhere.
+        Two open "PR closed without merging" cards on one task was once the
+        NORMAL condition on `pr-open`: `poll_prs` filtered its watch on phase
+        and pr_url but never on pr_state, so a closed-unmerged PR collected a
+        fresh card every tick until someone moved the phase, and the human
+        answered one of N. or-10 made the loop react to the transition
+        instead, so it now takes a close -> reopen -> close cycle rather than a
+        second tick — rarer, but not gone, and the shape is unchanged.
+
+        Either way this case does not depend on the poll loop: it builds both
+        cards with `orch approve-request` and asserts on `orch show`. What it
+        pins is that a second open card must not hide the decision on the
+        first, which is precisely when the orchestrator has just been woken to
+        relay that answer. Suppressing the decision here restored the original
+        symptom exactly: woken, with the note readable nowhere.
         """
         for phase in ("planning", "implementing", "needs-review", "reviewing",
                       "resolving", "pr-open"):

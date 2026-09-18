@@ -453,7 +453,16 @@ def add_task(state, key, title, source="manual", url=None, done_when=None,
 # reacts to CHANGES in it, not to PR state as such, so it is that loop's record
 # of what it has already reacted to: setting it to `closed` by hand suppresses
 # the question card for the next close, and setting it back to `open` re-arms
-# it. That is a deliberate escape hatch, but not a guessable one.
+# it. That is a deliberate escape hatch, but not a guessable one. It is read
+# case-insensitively, because "CLOSED" as `gh` prints it is what someone
+# copying from `gh` output writes, and an escape hatch that turns on
+# capitalisation is a trap rather than a hatch.
+#
+# No value here can suppress MERGED: a merge is acted on unconditionally, so
+# `--pr-state merged` on a live PR costs nothing. That is deliberate. A missed
+# close leaves a visibly open PR on the board; a missed merge is silent, and
+# a board that has quietly stopped noticing merges looks exactly like a board
+# with nothing to report.
 EDITABLE_FIELDS = (
     "title", "url", "source", "done_when",
     "branch", "workspace", "pane", "worktree", "pr_url", "pr_state",

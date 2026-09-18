@@ -38,13 +38,24 @@ import time
 
 from test_webapp_resolve import WebappCase
 
-# Prints whatever state the test currently wants and records the call, so a
-# case can both steer the answer and count completed ticks. Reaching the real
-# `gh` would ask GitHub about a made-up PR url.
+# Answers with whatever state the case currently wants — per PR when the case
+# set one, otherwise the shared default. Reaching the real `gh` would ask
+# GitHub about a made-up PR url.
+#
+# It records the call twice: once on entry, once on the way out WITH the
+# answer it actually served. The distinction is not pedantic. The entry line
+# is how a case knows a call is in flight; the exit line is the only thing
+# that proves a given tick read a given state. Waiting on entry lines to
+# decide the loop has reacted to a flipped answer is a race, and was one.
 GH_SHIM = """#!/bin/sh
-printf '%s\\n' "$*" >> "$FAKE_GH_LOG"
+printf '%s\\n' "$*" >> "$FAKE_GH_STARTS"
 [ -n "$FAKE_GH_DELAY" ] && sleep "$FAKE_GH_DELAY"
-cat "$FAKE_GH_STATE"
+src="$FAKE_GH_STATE"
+# `gh pr view <url> --json ...`, so the url is $3.
+[ -f "$FAKE_GH_DIR/$(basename "$3").json" ] && src="$FAKE_GH_DIR/$(basename "$3").json"
+body=$(cat "$src")
+printf '%s\\n' "$body"
+printf '%s\\n' "$body" >> "$FAKE_GH_LOG"
 exit 0
 """
 
@@ -57,19 +68,25 @@ class PollCase(WebappCase):
     def setUp(self):
         super().setUp()
         self.gh_log = os.path.join(self.tmp.name, "gh.log")
+        self.gh_starts = os.path.join(self.tmp.name, "gh-starts.log")
         self.gh_state = os.path.join(self.tmp.name, "gh-state.json")
         shim = os.path.join(self.tmp.name, "bin", "gh")
         with open(shim, "w") as fh:
             fh.write(GH_SHIM)
         os.chmod(shim, 0o755)
-        self.env.update(FAKE_GH_LOG=self.gh_log, FAKE_GH_STATE=self.gh_state)
+        self.gh_dir = os.path.join(self.tmp.name, "gh-per-pr")
+        os.makedirs(self.gh_dir)
+        self.env.update(FAKE_GH_LOG=self.gh_log, FAKE_GH_STARTS=self.gh_starts,
+                        FAKE_GH_STATE=self.gh_state, FAKE_GH_DIR=self.gh_dir)
         self.says("OPEN")
 
     def says(self, state):
         """Set what `gh pr view` answers from the next call on.
 
         Written through a rename so a call in flight reads one whole file or
-        the other, never a torn one.
+        the other, never a torn one. Remembers the state and where the served
+        log had reached, which is what lets `after_flip` wait on ticks that
+        actually saw this answer rather than on ticks that merely happened.
         """
         body = json.dumps({"state": state,
                            "mergedAt": "2026-01-01T00:00:00Z" if state == "MERGED" else None})
@@ -77,6 +94,17 @@ class PollCase(WebappCase):
         with open(tmp, "w") as fh:
             fh.write(body + "\n")
         os.replace(tmp, self.gh_state)
+        self.said = state
+        self.mark = len(self.served())
+
+    def says_for(self, pr, state):
+        """Set the answer for ONE pull request, overriding `says` for it."""
+        body = json.dumps({"state": state,
+                           "mergedAt": "2026-01-01T00:00:00Z" if state == "MERGED" else None})
+        tmp = os.path.join(self.gh_dir, "%s.json.tmp" % pr)
+        with open(tmp, "w") as fh:
+            fh.write(body + "\n")
+        os.replace(tmp, os.path.join(self.gh_dir, "%s.json" % pr))
 
     def park_on_an_open_pr(self, pr_state="open"):
         for phase in ("planning", "implementing", "needs-review", "reviewing",
@@ -86,11 +114,22 @@ class PollCase(WebappCase):
         self.orch("ack", "T-1")
         open(self.shim_log, "w").close()
 
+    def served(self):
+        """The answers `gh` has FINISHED giving, oldest first."""
+        if not os.path.exists(self.gh_log):
+            return []
+        with open(self.gh_log) as fh:
+            return [json.loads(ln)["state"] for ln in fh.read().splitlines() if ln.strip()]
+
     def ticks(self):
         """Completed `gh` calls so far."""
-        if not os.path.exists(self.gh_log):
+        return len(self.served())
+
+    def starts(self):
+        """`gh` calls that have BEGUN, in flight ones included."""
+        if not os.path.exists(self.gh_starts):
             return 0
-        with open(self.gh_log) as fh:
+        with open(self.gh_starts) as fh:
             return len([ln for ln in fh.read().splitlines() if ln.strip()])
 
     def wait_ticks(self, n, deadline=45):
@@ -119,13 +158,28 @@ class PollCase(WebappCase):
             time.sleep(0.05)
         self.fail("timed out after %ds waiting for %s" % (deadline, what))
 
-    def after_flip(self, extra=3):
-        """Wait out enough ticks that at least one saw the new `gh` answer.
+    def after_flip(self, n=2, deadline=45):
+        """Wait until the loop has acted on the answer `says` last set.
 
-        The call in flight when `says` landed may still be reading the old
-        file, so a single extra tick is not enough to be sure.
+        Waits for `n` ticks that served that answer, not for `n` ticks. The
+        poll loop is strictly sequential — read, act, sleep, read — so the
+        SECOND tick to serve a state proves the first one's transaction has
+        already been written. That makes this exact rather than a timing
+        guess: the call in flight when `says` landed may still have been
+        holding the old file, and waiting on tick counts alone let a case
+        assert against a board the loop had not reached yet.
         """
-        self.wait_ticks(self.ticks() + extra)
+        end = time.time() + deadline
+        while time.time() < end:
+            if self.served()[self.mark:].count(self.said) >= n:
+                return
+            time.sleep(0.05)
+        self.fail("timed out after %ds waiting for %d ticks serving %s; served %s"
+                  % (deadline, n, self.said, self.served()[self.mark:]))
+
+    def more_ticks(self, n=3):
+        """Let `n` further ticks complete, for cases proving nothing happens."""
+        self.wait_ticks(self.ticks() + n)
 
     def cards(self):
         return [a for a in self.state().get("approvals", [])
@@ -157,7 +211,7 @@ class TestClosedWithoutMerging(PollCase):
 
         self.says("CLOSED")
         self.after_flip()
-        self.after_flip()                        # and several ticks beyond the close
+        self.more_ticks()                        # and several ticks beyond the close
         cards = self.cards()
         self.assertEqual(len(cards), 1,
                          "one close is one decision, got %d cards" % len(cards))
@@ -184,8 +238,7 @@ class TestClosedWithoutMerging(PollCase):
         self.assertEqual(self.post("/api/resolve",
                                    {"approval": aid, "decision": "approved",
                                     "note": "abandon the branch"}), {"ok": True})
-        self.after_flip()
-        self.after_flip()
+        self.more_ticks(4)
         cards = self.cards()
         self.assertEqual(len(cards), 1,
                          "an answered card must not come back: %s"
@@ -202,22 +255,24 @@ class TestReopening(PollCase):
         `pr_state` sits lying at `closed` while GitHub says open, and the
         re-close is swallowed as a state already reacted to.
         """
+        # Waits are on the OUTCOME, then `more_ticks` proves it settles there.
+        # This case walks the board through four states, so asserting at a tick
+        # boundary makes the whole thing rest on reasoning about which tick has
+        # acted; waiting for the state and then proving it is stable does not.
         self.park_on_an_open_pr()
         self.says("CLOSED")
         self.serve(poll=1)
-        self.after_flip()
-        self.assertEqual(len(self.cards()), 1)
+        self.wait_for(lambda: len(self.cards()) == 1, "the first card")
         self.orch("resolve", self.cards()[0]["id"], "--decision", "approved",
                   "--note", "reopen it")
 
         self.says("OPEN")
-        self.after_flip()
-        self.assertEqual(self.task()["pr_state"], "open", "the reopen is recorded")
+        self.wait_for(lambda: self.task()["pr_state"] == "open", "the reopen")
         self.assertEqual(len(self.cards()), 1, "reopening is not itself a question")
 
         self.says("CLOSED")
-        self.after_flip()
-        self.after_flip()
+        self.wait_for(lambda: len(self.cards()) == 2, "the card for the second close")
+        self.more_ticks()
         cards = self.cards()
         self.assertEqual(len(cards), 2,
                          "a second close is a second decision, got %d" % len(cards))
@@ -271,7 +326,7 @@ class TestSteadyStateIsQuiet(PollCase):
         self.serve(poll=1)
         self.wait_ticks(1)
         before = os.stat(os.path.join(self.board, "state.json")).st_mtime_ns
-        self.wait_ticks(self.ticks() + 3)
+        self.more_ticks()
         self.assertEqual(os.stat(os.path.join(self.board, "state.json")).st_mtime_ns,
                          before, "an unchanged open PR must not rewrite the board")
         self.assertEqual(self.cards(), [])
@@ -295,16 +350,179 @@ class TestTheRaceUnderTheLock(PollCase):
         self.says("CLOSED")
         self.env["FAKE_GH_DELAY"] = "3"        # hold the round-trip open
         self.serve(poll=1)
-        self.wait_ticks(1)                     # the call is in flight, not done
+        self.wait_for(lambda: self.starts() >= 1,
+                      "the gh call to begin")   # in flight, not done
 
         # Someone records the close by hand while `gh` is still answering, so
         # the snapshot the loop is holding ("open") is now stale.
         self.orch("set", "T-1", "--pr-state", "closed")
-        self.wait_for(lambda: self.ticks() >= 2, "the in-flight call to finish")
-        time.sleep(1)                          # and the transaction behind it
+        # A second call STARTING proves the first one's transaction is written:
+        # the loop reads, acts, sleeps, reads.
+        self.wait_for(lambda: self.starts() >= 2,
+                      "the in-flight call to finish and its transaction to land")
 
         cards = self.cards()
         self.assertEqual(len(cards), 0,
                          "the close was already recorded; the stale snapshot "
                          "must not card again: %s" % [c["id"] for c in cards])
         self.assertEqual(self.task()["pr_state"], "closed")
+
+
+class TestMergeIsUnconditional(PollCase):
+    """A merge always acts, whatever the board last recorded.
+
+    Putting a task back on `pr-open` after a merge is an ordinary recovery
+    move — the merge was reverted, or more work turned out to be needed — and
+    `set_phase` permits it with no `--force`. The task then carries
+    `pr_state="merged"` while its PR is live again.
+
+    That is the one input where filtering the `gh` answer against the recorded
+    state is wrong. A missed close is loud: the card never goes up but the
+    board still shows an open PR. A missed merge is silent, and worse, it never
+    self-heals — the task is dropped before the lock, so nothing rewrites
+    `pr_state`, and the loop stays blind to that PR for the life of the task
+    while everything else about the board looks healthy.
+    """
+
+    def test_a_task_put_back_on_pr_open_after_a_merge_still_sees_a_merge(self):
+        self.park_on_an_open_pr()
+        self.says("MERGED")
+        self.serve(poll=1)
+        self.wait_for(lambda: self.task()["phase"] == "merged", "the first merge")
+        self.assertEqual(self.task()["pr_state"], "merged")
+
+        # The recovery move: merge reverted, more work needed, second PR.
+        self.orch("phase", "T-1", "pr-open")
+        self.orch("set", "T-1", "--pr-url", PR_URL.replace("/1", "/2"))
+        self.assertEqual(self.task()["pr_state"], "merged",
+                         "nothing resets pr_state on the way back to pr-open")
+
+        # No tick-counting here: on a working fix the very next tick moves the
+        # task to `merged` and so out of the watch, and no further tick lands.
+        self.wait_for(lambda: self.task()["phase"] == "merged",
+                      "the second merge, on a task whose pr_state is already merged")
+
+
+class TestTheLogTellsTheTruth(PollCase):
+    """The board log is what a human reads to reconstruct what became of a PR.
+
+    The OPEN branch is reached whenever `gh` says OPEN and `pr_state` is
+    anything but "open" — which includes two states that are not reopens at
+    all: `pr_state` starts null and `orch set --pr-url` alone leaves it that
+    way, and a task put back on `pr-open` after a merge arrives carrying
+    "merged". Both have to be recorded, neither is an event.
+    """
+
+    def log_lines(self):
+        return [e["msg"] if isinstance(e, dict) else str(e)
+                for e in self.state().get("log", [])]
+
+    def test_a_pr_that_was_only_ever_open_logs_no_reopen(self):
+        for phase in ("planning", "implementing", "needs-review", "reviewing",
+                      "resolving", "pr-open"):
+            self.orch("phase", "T-1", phase)
+        self.orch("set", "T-1", "--pr-url", PR_URL)   # no --pr-state; stays null
+        self.assertIsNone(self.task()["pr_state"])
+        self.serve(poll=1)
+        self.wait_ticks(2)
+        self.wait_for(lambda: self.task()["pr_state"] == "open",
+                      "the null pr_state to be recorded")
+        self.assertEqual([ln for ln in self.log_lines() if "reopened" in ln], [],
+                         "this PR never closed, so it never reopened")
+
+    def test_a_real_reopen_is_still_logged(self):
+        """The other half: suppressing the false line must not lose the true
+        one, which is the only record that the close was undone."""
+        self.park_on_an_open_pr()
+        self.says("CLOSED")
+        self.serve(poll=1)
+        self.after_flip()
+        self.assertEqual(len(self.cards()), 1)
+
+        self.says("OPEN")
+        self.after_flip()
+        self.assertEqual(self.task()["pr_state"], "open")
+        self.assertTrue([ln for ln in self.log_lines() if "PR reopened" in ln],
+                        "a genuine close -> open move is worth a log line")
+
+
+class TestPrStateIsReadCaseInsensitively(PollCase):
+    """`pr_state` is written by hand as well as by this loop.
+
+    `gh` prints states uppercase, so "CLOSED" is what someone typing
+    `orch set --pr-state` from a `gh` output reasonably writes, and
+    `update_task` neither validates nor normalises it. The suppress/re-arm
+    escape hatch the field's comment documents should not turn on
+    capitalisation — the card it fails to suppress is exactly the duplicate
+    this task exists to remove.
+    """
+
+    def test_an_uppercase_closed_suppresses_the_card_like_a_lowercase_one(self):
+        self.park_on_an_open_pr(pr_state="CLOSED")
+        self.says("CLOSED")
+        self.serve(poll=1)
+        self.wait_ticks(3)
+        self.assertEqual(self.cards(), [],
+                         "already recorded as closed, whatever the spelling")
+
+
+class TestTasksDoNotBleedIntoEachOther(PollCase):
+    """Several PRs are watched in one tick, and the state is now per task.
+
+    The watch used to carry `(id, url)` and this change made it
+    `(id, url, pr_state)`, so each task's answer is now filtered against its
+    OWN recorded state and the results are dispatched from a dict keyed by
+    task id. Every other case here drives a single task, which is exactly the
+    shape that cannot catch a mix-up — and the real board watches two.
+    """
+
+    def park_both(self):
+        self.orch("add", "T-2", "--project", "tw", "--title", "second")
+        for key, pr in (("T-1", "1"), ("T-2", "2")):
+            for phase in ("planning", "implementing", "needs-review", "reviewing",
+                          "resolving", "pr-open"):
+                self.orch("phase", key, phase)
+            self.orch("set", key, "--pr-url", PR_URL.replace("/1", "/" + pr),
+                      "--pr-state", "open")
+            self.orch("ack", key)
+        open(self.shim_log, "w").close()
+
+    def task_for(self, key):
+        import store
+        return store.find(self.state(), key)
+
+    def test_one_closing_while_the_other_merges(self):
+        """Each task gets its own outcome, and neither answer is applied to
+        the other."""
+        self.park_both()
+        self.says_for("1", "CLOSED")
+        self.says_for("2", "MERGED")
+        self.serve(poll=1)
+        self.wait_for(lambda: self.task_for("T-2")["phase"] == "merged",
+                      "T-2 to be seen merging")
+        self.wait_for(lambda: self.task_for("T-1")["pr_state"] == "closed",
+                      "T-1 to be seen closing")
+
+        cards = [a for a in self.state()["approvals"]
+                 if a["title"] == "PR closed without merging"]
+        self.assertEqual(len(cards), 1, "only the closed PR is a question")
+        self.assertEqual(cards[0]["key"], "T-1")
+        self.assertEqual(self.task_for("T-1")["phase"], "pr-open")
+        self.assertEqual(self.task_for("T-2")["pr_state"], "merged")
+
+    def test_a_task_already_carded_does_not_suppress_a_sibling(self):
+        """The filter is per task: T-1 sitting at `closed` with nothing to say
+        must not stop T-2's close from being noticed on the same tick."""
+        self.park_both()
+        self.orch("set", "T-1", "--pr-state", "closed")
+        self.says_for("1", "CLOSED")          # already recorded; nothing to do
+        self.says_for("2", "CLOSED")          # a fresh close
+        self.serve(poll=1)
+        self.wait_for(lambda: self.task_for("T-2")["pr_state"] == "closed",
+                      "T-2 to be seen closing")
+        self.more_ticks()
+
+        cards = [a for a in self.state()["approvals"]
+                 if a["title"] == "PR closed without merging"]
+        self.assertEqual([c["key"] for c in cards], ["T-2"],
+                         "exactly one card, on the task that actually changed")
