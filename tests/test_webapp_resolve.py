@@ -128,15 +128,20 @@ class WebappCase(unittest.TestCase):
                                                   r.stdout, r.stderr))
         return r
 
-    def serve(self, pane=None):
-        """Start the board. `pane` sets the HERDR_PANE_ID it inherits."""
+    def serve(self, pane=None, poll=0):
+        """Start the board. `pane` sets the HERDR_PANE_ID it inherits.
+
+        `poll` is the PR poll interval, 0 (off) for everything that is not
+        testing the poll loop itself. A case that turns it on must put a `gh`
+        shim on PATH ahead of the real one — see tests/test_webapp_poll.py —
+        because a live `gh` here would ask GitHub about a made-up PR url.
+        """
         env = dict(self.env)
         if pane:
             env["HERDR_PANE_ID"] = pane
         self.port = free_port()
-        # poll-seconds 0: no `gh` calls, so a test never touches the network.
         self.proc = subprocess.Popen(
-            [sys.executable, SERVER, "--port", str(self.port), "--poll-seconds", "0"],
+            [sys.executable, SERVER, "--port", str(self.port), "--poll-seconds", str(poll)],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self.addCleanup(self.stop)
         deadline = time.time() + 20

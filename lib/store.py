@@ -448,6 +448,12 @@ def add_task(state, key, title, source="manual", url=None, done_when=None,
 # is derived from `key` when the task is created, `find` resolves and
 # disambiguates by `key`, and `project` names the repo a worktree was cut from.
 # Rewriting either on a live task orphans real artifacts.
+#
+# `pr_state` is not cosmetic, and reads as if it were. The webapp's `poll_prs`
+# reacts to CHANGES in it, not to PR state as such, so it is that loop's record
+# of what it has already reacted to: setting it to `closed` by hand suppresses
+# the question card for the next close, and setting it back to `open` re-arms
+# it. That is a deliberate escape hatch, but not a guessable one.
 EDITABLE_FIELDS = (
     "title", "url", "source", "done_when",
     "branch", "workspace", "pane", "worktree", "pr_url", "pr_state",
