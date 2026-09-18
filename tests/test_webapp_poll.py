@@ -50,16 +50,28 @@ from test_webapp_resolve import WebappCase
 GH_SHIM = """#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_GH_STARTS"
 [ -n "$FAKE_GH_DELAY" ] && sleep "$FAKE_GH_DELAY"
+# Builtins only past this point — no basename, no cat, no $( ). Every fork
+# here is one the poll loop waits on, once per watched PR per tick, and a
+# developer box under real load (other agents, a virus scanner) is where a
+# suite that forks four times a tick stops keeping up with a 1s interval.
+# `gh pr view <url> --json ...`, so the url is $3 and ${3##*/} is its number.
 src="$FAKE_GH_STATE"
-# `gh pr view <url> --json ...`, so the url is $3.
-[ -f "$FAKE_GH_DIR/$(basename "$3").json" ] && src="$FAKE_GH_DIR/$(basename "$3").json"
-body=$(cat "$src")
+[ -f "$FAKE_GH_DIR/${3##*/}.json" ] && src="$FAKE_GH_DIR/${3##*/}.json"
+read -r body < "$src"
 printf '%s\\n' "$body"
 printf '%s\\n' "$body" >> "$FAKE_GH_LOG"
 exit 0
 """
 
 PR_URL = "https://github.com/example/repo/pull/1"
+
+# How long a wait may take before it is called a failure. Deliberately far
+# above what the work needs: at a 1s poll interval every wait here wants two
+# or three ticks, so a few seconds. The headroom is for the machine, not the
+# code — these ran green for a long time and then failed three different ways
+# on a box at load average 41, each one starved of ticks rather than wrong.
+# A real hang still fails, just later.
+TICK_DEADLINE = 150
 
 
 class PollCase(WebappCase):
@@ -132,18 +144,20 @@ class PollCase(WebappCase):
         with open(self.gh_starts) as fh:
             return len([ln for ln in fh.read().splitlines() if ln.strip()])
 
-    def wait_ticks(self, n, deadline=45):
+    def wait_ticks(self, n, deadline=TICK_DEADLINE):
         """Block until the poll loop has completed at least `n` `gh` calls."""
         end = time.time() + deadline
         while time.time() < end:
             if self.ticks() >= n:
                 return
             time.sleep(0.05)
-        self.fail("only %d poll ticks in %ds, wanted %d — zero ticks means the "
-                  "task was dropped from the watch, not that carding was "
-                  "suppressed" % (self.ticks(), deadline, n))
+        self.fail("only %d poll ticks in %ds, wanted %d. Zero ticks means the task "
+                  "was dropped from the watch, not that carding was suppressed; a "
+                  "few means the loop was starved (check machine load) or the poll "
+                  "thread died — the server said:\n%s"
+                  % (self.ticks(), deadline, n, self.server_output()))
 
-    def wait_for(self, predicate, what, deadline=45):
+    def wait_for(self, predicate, what, deadline=TICK_DEADLINE):
         """Block until `predicate()` holds.
 
         Needed wherever the expected outcome takes the task OUT of the watch:
@@ -156,9 +170,11 @@ class PollCase(WebappCase):
             if predicate():
                 return
             time.sleep(0.05)
-        self.fail("timed out after %ds waiting for %s" % (deadline, what))
+        self.fail("timed out after %ds waiting for %s (%d poll ticks meanwhile) — "
+                  "the server said:\n%s"
+                  % (deadline, what, self.ticks(), self.server_output()))
 
-    def after_flip(self, n=2, deadline=45):
+    def after_flip(self, n=2, deadline=TICK_DEADLINE):
         """Wait until the loop has acted on the answer `says` last set.
 
         Waits for `n` ticks that served that answer, not for `n` ticks. The
@@ -174,8 +190,12 @@ class PollCase(WebappCase):
             if self.served()[self.mark:].count(self.said) >= n:
                 return
             time.sleep(0.05)
-        self.fail("timed out after %ds waiting for %d ticks serving %s; served %s"
-                  % (deadline, n, self.said, self.served()[self.mark:]))
+        self.fail("timed out after %ds waiting for %d ticks serving %s; served %s "
+                  "since the flip. Few or no ticks means the loop was starved or "
+                  "the poll thread died rather than that it ignored the state — "
+                  "the server said:\n%s"
+                  % (deadline, n, self.said, self.served()[self.mark:],
+                     self.server_output()))
 
     def more_ticks(self, n=3):
         """Let `n` further ticks complete, for cases proving nothing happens."""

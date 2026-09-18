@@ -140,9 +140,17 @@ class WebappCase(unittest.TestCase):
         if pane:
             env["HERDR_PANE_ID"] = pane
         self.port = free_port()
+        # To a file, not a pipe. Nothing in a test reads the server's output
+        # while it runs, and a pipe nobody drains blocks the process that
+        # fills it; a file is also readable at any moment, which is what lets
+        # a failing wait say what the server was doing instead of only that it
+        # waited.
+        self.server_log = os.path.join(self.tmp.name, "server-%d.log" % self.port)
+        self.server_fh = open(self.server_log, "w")
+        self.addCleanup(self.server_fh.close)
         self.proc = subprocess.Popen(
             [sys.executable, SERVER, "--port", str(self.port), "--poll-seconds", str(poll)],
-            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            env=env, stdout=self.server_fh, stderr=subprocess.STDOUT, text=True)
         self.addCleanup(self.stop)
         deadline = time.time() + 20
         while time.time() < deadline:
@@ -153,9 +161,24 @@ class WebappCase(unittest.TestCase):
                 return
             except Exception:                               # noqa: BLE001
                 if self.proc.poll() is not None:
-                    self.fail("server exited: %s" % self.proc.communicate()[0])
+                    self.fail("server exited: %s" % self.server_output())
                 time.sleep(0.1)
         self.fail("server did not come up")
+
+    def server_output(self):
+        """Everything the server has printed so far, stdout and stderr both.
+
+        A daemon thread that dies takes its traceback here and nowhere else —
+        `poll_prs` would simply stop polling for the life of the process, with
+        the board looking perfectly healthy. Worth reading whenever a wait on
+        the server times out.
+        """
+        try:
+            self.server_fh.flush()
+            with open(self.server_log) as fh:
+                return fh.read().strip() or "(nothing)"
+        except Exception:                                   # noqa: BLE001
+            return "(unavailable)"
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -629,7 +652,7 @@ class TestStartupBanner(WebappCase):
     def test_it_names_the_commit_and_says_to_restart(self):
         self.serve()
         self.stop()
-        out = self.proc.communicate()[0]
+        out = self.server_output()
         self.assertIn("code:", out)
         self.assertIn("restart after a `git pull`", out)
         sha = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"],
