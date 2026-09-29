@@ -233,6 +233,19 @@ raises a `question` approval and changes nothing else, since that needs your
 decision. Detection only — the webapp never removes a worktree or deletes a
 branch.
 
+The thread is the only thing watching PRs, so it must not die quietly. A
+failed read or transaction is printed, logged to the board once per distinct
+failure (plus one "recovered" line), and the loop carries on. A raise before
+the commit leaves `pr_state` alone, so the next tick retries it. A raise after
+the commit (`board.md` failing to render) still sends the merge wake-ups it
+recorded. A tick in which `gh` answers for no watched PR counts as a failure,
+so expired auth does not look healthy. `/api/state` carries
+`_poll`, an in-memory heartbeat (liveness, last tick, last error). The board
+header shows it as a pill that warns when the thread has exited, the last tick
+failed, or no tick has run for 3× the interval plus a minute. It is not kept
+in `state.json`: that would take the lock every tick, and it describes this
+process only.
+
 ### The Plannotator gate
 
 A worker writes its plan to `PLAN.md` in its worktree and attaches the path to
@@ -256,6 +269,12 @@ the gate sends the wake-up itself; without that the annotations would land in
 
 The approval is re-checked for `pending` after the review returns, in case it
 was settled from the inline buttons while the gate was open.
+
+If that transaction fails, the gate first checks whether the verdict was saved
+anyway, since `state.json` is committed before `board.md` is rendered. If it
+was saved, the gate just sends the wake-up. Otherwise the verdict and feedback
+are printed verbatim to the webapp's output. A second, guarded transaction clears `review_started` and logs
+the failure. Without that, the button would stay refused as "already open".
 
 ### The UI
 
