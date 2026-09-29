@@ -28,6 +28,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import time
 import unittest
 import urllib.request
@@ -96,6 +97,34 @@ class TestATransactionFailureDoesNotEndPolling(ApiStateMixin, PollCase):
         self.assertIn("PR poll: applying PR state", self.server_output())
 
 
+GH_BROKEN = """#!/bin/sh
+echo "gh: To get started with GitHub CLI, please run:  gh auth login" >&2
+exit 4
+"""
+
+
+class TestGhFailingEverywhereIsVisible(ApiStateMixin, PollCase):
+    """`last_tick` moves every tick, so a poller whose every `gh` call fails
+    (expired auth) would read as healthy while checking nothing at all."""
+
+    def test_no_answers_reads_as_failing_and_clears_when_gh_recovers(self):
+        self.park_on_an_open_pr()
+        shim = os.path.join(self.tmp.name, "bin", "gh")
+        with open(shim) as fh:
+            good = fh.read()
+        with open(shim, "w") as fh:
+            fh.write(GH_BROKEN)
+        self.serve(poll=1)
+        self.wait_api(lambda p: p["last_error"] is not None, "gh failing to be reported")
+        err = self.api_state()["_poll"]["last_error"]["error"]
+        self.assertIn("asking gh", err)
+        self.assertIn("gh auth login", err, "the reason should reach the board")
+
+        with open(shim, "w") as fh:
+            fh.write(good)
+        self.wait_api(lambda p: p["last_error"] is None, "the error to clear")
+
+
 class TestHeartbeatIsServed(ApiStateMixin, PollCase):
     def test_a_running_poller_reports_recent_ticks(self):
         self.serve(poll=1)
@@ -127,6 +156,23 @@ def flaky(n):
             raise OSError("disk went away")
         with real(pdir) as st:
             yield st
+    return tx
+
+
+def commits_then_raises(n):
+    """A `store.transaction` whose first `n` uses commit state.json and THEN
+    raise — `render_board` failing after `os.replace`, which is where
+    `store.write` can fail with the state already on disk."""
+    real = store.transaction
+    calls = {"n": 0}
+
+    @contextlib.contextmanager
+    def tx(pdir):
+        calls["n"] += 1
+        with real(pdir) as st:
+            yield st
+        if calls["n"] <= n:
+            raise OSError("board.md: no space left on device")
     return tx
 
 
@@ -174,8 +220,28 @@ class TestPollFailureReporting(ServerInProcess):
         self.assertEqual(len(self.log_lines("PR poll failed")), 1)
 
 
+class TestTerminalOutputCannotKillTheThread(ServerInProcess):
+    def test_a_dead_terminal_does_not_raise_out_of_the_handler(self):
+        class Gone(io.StringIO):
+            def write(self, *_):
+                raise OSError(5, "Input/output error")
+        with mock.patch("sys.stderr", Gone()):
+            self.srv._poll_failed("applying PR state", ValueError("boom"))
+        self.assertEqual(len(self.log_lines("PR poll failed")), 1)
+
+
+class TestLandedHandoffs(ServerInProcess):
+    def test_only_handoffs_on_disk_are_kept(self):
+        self.orch("phase", "T-1", "planning")
+        self.orch("phase", "T-1", "awaiting-plan")
+        h = self.srv.notify.pending(self.state(), "T-1")
+        self.assertIsNotNone(h, "the case needs a pending handoff")
+        ghost = dict(h, id="h-never-written")
+        self.assertEqual(self.srv._landed([h, ghost, None]), [h])
+
+
 class TestGateTransactionFailure(ServerInProcess):
-    def gate_with(self, verdict, failures):
+    def gate_with(self, verdict, failures, tx=flaky):
         plan = os.path.join(self.repo, "PLAN.md")
         with open(plan, "w") as fh:
             fh.write("# plan\n")
@@ -183,9 +249,19 @@ class TestGateTransactionFailure(ServerInProcess):
         with store.transaction(self.board) as st:
             st["approvals"][0]["review_started"] = store.now()
         proc = mock.Mock(stdout=json.dumps(verdict) + "\n", returncode=0)
-        with mock.patch.object(self.srv.subprocess, "run", return_value=proc), \
-                mock.patch.object(store, "transaction", flaky(failures)):
-            return self.quietly(self.srv.run_plannotator_gate, aid, plan)
+        real_run = subprocess.run
+
+        # Only Plannotator is faked. `subprocess` is one module shared with
+        # notify, so a blanket mock also swallows the herdr wake-up and makes
+        # it report "prompted" without anything having run.
+        def run(argv, *a, **kw):
+            return proc if argv[0] == "plannotator" else real_run(argv, *a, **kw)
+        with mock.patch.object(self.srv.subprocess, "run", side_effect=run), \
+                mock.patch.object(store, "transaction", tx(failures)), \
+                mock.patch.dict(os.environ, self.env):
+            out = self.quietly(self.srv.run_plannotator_gate, aid, plan)
+            self.sent = self.prompts(deadline=5)   # the wake-up is threaded
+        return out
 
     def test_a_lost_verdict_re_arms_the_review_and_keeps_the_feedback(self):
         out = self.gate_with({"decision": "annotated", "feedback": "fix bullet two"}, 1)
@@ -195,6 +271,16 @@ class TestGateTransactionFailure(ServerInProcess):
                           "left set, every later review is refused as already open")
         self.assertTrue(self.log_lines("could not be recorded"))
         self.assertIn("fix bullet two", out, "the annotations must survive somewhere")
+
+    def test_a_verdict_saved_before_the_raise_still_wakes_and_is_not_disowned(self):
+        self.gate_with({"decision": "annotated", "feedback": "fix bullet two"}, 1,
+                       tx=commits_then_raises)
+        a = self.state()["approvals"][0]
+        self.assertEqual(a["status"], "rejected")
+        self.assertEqual(a["decision_note"], "fix bullet two")
+        self.assertEqual(self.log_lines("could not be recorded"), [],
+                         "the verdict was recorded; saying otherwise misleads")
+        self.assertTrue(self.sent, "the saved verdict's wake-up was dropped")
 
     def test_a_board_that_stays_broken_does_not_raise(self):
         out = self.gate_with({"decision": "approved", "feedback": "ship it"}, 2)

@@ -224,12 +224,29 @@ def run_plannotator_gate(approval_id, plan_path):
     except Exception as e:                                  # noqa: BLE001
         # Uncaught, this ended the thread with the verdict in nobody's hands
         # and `review_started` still set, so every later "Review in
-        # Plannotator" was refused as already open. The failed transaction
-        # wrote nothing; the verdict goes to the terminal verbatim, and a
+        # Plannotator" was refused as already open.
+        #
+        # Check what landed before saying anything: `store.write` commits
+        # state.json before rendering board.md, so the raise may have come
+        # after the verdict was saved. Then the only thing lost is the
+        # wake-up, and that is still ours to send.
+        try:
+            st = store.read(PDIR)
+            a = next((x for x in st.get("approvals", []) if x["id"] == approval_id), None)
+        except Exception:                                   # noqa: BLE001
+            a = None
+        # Matched on this verdict, not merely "no longer pending": a card
+        # settled from the inline buttons meanwhile already woke someone.
+        want = {"approved": "approved", "annotated": "rejected"}.get(decision)
+        if a and want and a["status"] == want and a.get("decision_note") == feedback:
+            _say("plan review %s: verdict saved, but the board write then failed (%s: %s)"
+                 % (approval_id, type(e).__name__, e))
+            _wake_later(notify.pending(st, a["task"]))
+            return
+        # It did not land: the verdict goes to the terminal verbatim, and a
         # second, guarded transaction re-arms the button and says why.
-        print("plan review %s: verdict %r could not be recorded (%s: %s); feedback:\n%s"
-              % (approval_id, decision, type(e).__name__, e, feedback or "(none)"),
-              file=sys.stderr, flush=True)
+        _say("plan review %s: verdict %r could not be recorded (%s: %s); feedback:\n%s"
+             % (approval_id, decision, type(e).__name__, e, feedback or "(none)"))
         try:
             with store.transaction(PDIR) as st:
                 a = next((x for x in st.get("approvals", []) if x["id"] == approval_id),
@@ -249,6 +266,33 @@ def run_plannotator_gate(approval_id, plan_path):
     _wake_later(handoff)
 
 
+def _say(msg):
+    """Print to the terminal from a daemon thread, never raising.
+
+    The terminal the webapp was launched from can be long gone, and a write to
+    it that raises inside an `except` handler ends the thread it was guarding.
+    """
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except Exception:                                       # noqa: BLE001
+        pass
+
+
+def _landed(handoffs):
+    """The handoffs of a failed transaction that reached state.json anyway.
+
+    `store.write` commits state.json before rendering board.md, so a raise can
+    come after the commit. Dropping those wake-ups is silent for good on a
+    merge: the task has left `pr-open`, so no later tick revisits it.
+    """
+    try:
+        pending = {h["id"] for h in store.read(PDIR).get("handoffs", [])
+                   if h.get("status") == "pending"}
+    except Exception:                                       # noqa: BLE001
+        return []
+    return [h for h in handoffs if h and h["id"] in pending]
+
+
 def _poll_failed(where, err):
     """Record a failed poll tick without ending the loop.
 
@@ -260,7 +304,7 @@ def _poll_failed(where, err):
     global _poll_logged
     msg = "%s: %s: %s" % (where, type(err).__name__, err)
     POLL["last_error"] = {"at": store.now(), "error": msg}
-    print("PR poll: %s" % msg, file=sys.stderr, flush=True)
+    _say("PR poll: %s" % msg)
     if msg == _poll_logged:
         return
     try:
@@ -335,13 +379,16 @@ def poll_prs(interval):
         # Every network call happens outside the lock. Holding flock across a
         # `gh` round-trip would stall the orchestrator and every worker.
         found = {}
+        answered, gh_err = 0, None
         for tid, url, seen in watch:
             try:
                 r = subprocess.run(["gh", "pr", "view", url, "--json", "state,mergedAt"],
                                    capture_output=True, text=True, timeout=20)
                 if r.returncode != 0:
+                    gh_err = (r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1]
                     continue
                 state = (json.loads(r.stdout).get("state") or "").upper()
+                answered += 1
                 # A MERGED answer ALWAYS reaches the lock, never filtered. The
                 # in-lock code acts on it before the transition test for the
                 # same reason, and doing it in only one of the two places is
@@ -363,8 +410,17 @@ def poll_prs(interval):
                 if state == "MERGED" or (state in ("CLOSED", "OPEN")
                                          and state != (seen or "").upper()):
                     found[tid] = state
-            except Exception:
+            except Exception as e:                          # noqa: BLE001
+                gh_err = "%s: %s" % (type(e).__name__, e)
                 continue  # transient network/auth trouble; try again next tick
+
+        # A tick in which `gh` answered for no PR checked nothing, however
+        # recent `last_tick` is — expired auth reads exactly like this. One
+        # failed call among several is the transient case above and stays quiet.
+        if not answered:
+            _poll_failed("asking gh", RuntimeError(
+                "no answer for any of %d watched PR(s): %s" % (len(watch), gh_err)))
+            continue
 
         if not found:
             _poll_ok()
@@ -372,9 +428,10 @@ def poll_prs(interval):
 
         # Guarded, because this thread is the only thing watching PRs: an
         # exception here used to end it silently, and the board kept looking
-        # healthy while nothing was ever checked again. A failed transaction
-        # writes nothing, so `pr_state` is untouched and the next tick retries
-        # the same transition by itself.
+        # healthy while nothing was ever checked again. A raise before the
+        # commit leaves `pr_state` untouched, so the next tick retries the same
+        # transition by itself; one after it (board.md failing to render) has
+        # already recorded the handoffs, and `_landed` keeps their wake-ups.
         handoffs = []
         try:
             with store.transaction(PDIR) as st2:
@@ -417,8 +474,9 @@ def poll_prs(interval):
                             store.log(st2, "%s PR reopened" % t["key"])
         except Exception as e:                              # noqa: BLE001
             _poll_failed("applying PR state", e)
-            continue
-        _poll_ok()
+            handoffs = _landed(handoffs)
+        else:
+            _poll_ok()
         for h in handoffs:
             _wake_later(h)
 
