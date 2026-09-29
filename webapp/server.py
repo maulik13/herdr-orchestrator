@@ -27,6 +27,15 @@ STATIC = os.path.join(os.path.dirname(os.path.realpath(__file__)), "static")
 PDIR = None          # the single board
 HAVE_PLANNOTATOR = False
 
+# The PR poller's heartbeat, served as `_poll` on /api/state. In memory, not in
+# state.json: the question it answers is "is THIS process still checking PRs",
+# the same process serves the board, and writing it to disk would take the
+# board lock every tick — which the loop is built to avoid.
+POLL = {"enabled": False, "interval": None, "last_tick": None, "last_error": None,
+        "off_reason": None}
+POLL_THREAD = None
+_poll_logged = None   # the failure last written to the board log, for dedupe
+
 TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
          ".css": "text/css; charset=utf-8"}
 
@@ -64,6 +73,9 @@ class Handler(BaseHTTPRequestHandler):
                 t["_deletable"] = store.deletable(t)
                 t["_blocking"] = len(store.blocking_open(st, t["id"]))
             st["_plannotator"] = HAVE_PLANNOTATOR
+            # Liveness alongside the heartbeat: a dead thread and a starved one
+            # look the same from `last_tick` alone.
+            st["_poll"] = dict(POLL, alive=bool(POLL_THREAD and POLL_THREAD.is_alive()))
             return self._json(st)
 
         rel = "index.html" if path == "/" else path.lstrip("/")
@@ -192,26 +204,85 @@ def run_plannotator_gate(approval_id, plan_path):
     feedback = (verdict.get("feedback") or "").strip() or None
 
     handoff = None
-    with store.transaction(PDIR) as st:
-        a = next((x for x in st.get("approvals", []) if x["id"] == approval_id), None)
-        if not a:
-            return
-        a["review_started"] = None
-        if a["status"] != "pending":
-            return          # settled elsewhere while the gate was open
-        if decision in ("approved", "annotated"):
-            store.resolve_approval(st, approval_id,
-                                   "approved" if decision == "approved" else "rejected",
-                                   feedback)
-            handoff = notify.pending(st, a["task"])
-        else:
-            # dismissed, or the gate failed to start: leave it for the human.
-            store.log(st, "%s plan review closed without a decision (%s)"
-                      % (a["key"], decision or "no result"))
+    try:
+        with store.transaction(PDIR) as st:
+            a = next((x for x in st.get("approvals", []) if x["id"] == approval_id), None)
+            if not a:
+                return
+            a["review_started"] = None
+            if a["status"] != "pending":
+                return          # settled elsewhere while the gate was open
+            if decision in ("approved", "annotated"):
+                store.resolve_approval(st, approval_id,
+                                       "approved" if decision == "approved" else "rejected",
+                                       feedback)
+                handoff = notify.pending(st, a["task"])
+            else:
+                # dismissed, or the gate failed to start: leave it for the human.
+                store.log(st, "%s plan review closed without a decision (%s)"
+                          % (a["key"], decision or "no result"))
+    except Exception as e:                                  # noqa: BLE001
+        # Uncaught, this ended the thread with the verdict in nobody's hands
+        # and `review_started` still set, so every later "Review in
+        # Plannotator" was refused as already open. The failed transaction
+        # wrote nothing; the verdict goes to the terminal verbatim, and a
+        # second, guarded transaction re-arms the button and says why.
+        print("plan review %s: verdict %r could not be recorded (%s: %s); feedback:\n%s"
+              % (approval_id, decision, type(e).__name__, e, feedback or "(none)"),
+              file=sys.stderr, flush=True)
+        try:
+            with store.transaction(PDIR) as st:
+                a = next((x for x in st.get("approvals", []) if x["id"] == approval_id),
+                         None)
+                if a:
+                    a["review_started"] = None
+                store.log(st, "%s plan review verdict (%s) could not be recorded: %s: %s"
+                          " — the feedback is in the webapp's output; review again"
+                          % (a["key"] if a else approval_id, decision or "no result",
+                             type(e).__name__, e))
+        except Exception:                                   # noqa: BLE001
+            pass      # the terminal has it; nothing else left to write to
+        return
     # A Plannotator verdict is the human deciding without touching the board,
     # so without this the annotations land in state.json and the worker that
     # needs them never hears.
     _wake_later(handoff)
+
+
+def _poll_failed(where, err):
+    """Record a failed poll tick without ending the loop.
+
+    Always to the terminal and the heartbeat; to the board log once per
+    distinct failure, because a persistent fault logged every tick would push
+    everything else out of a log capped at 40 lines within the hour. The board
+    write is itself guarded — it can fail for the same reason the tick did.
+    """
+    global _poll_logged
+    msg = "%s: %s: %s" % (where, type(err).__name__, err)
+    POLL["last_error"] = {"at": store.now(), "error": msg}
+    print("PR poll: %s" % msg, file=sys.stderr, flush=True)
+    if msg == _poll_logged:
+        return
+    try:
+        with store.transaction(PDIR) as st:
+            store.log(st, "PR poll failed (%s); still polling" % msg)
+        _poll_logged = msg
+    except Exception:                                       # noqa: BLE001
+        pass          # retried on the next failure; the heartbeat shows it now
+
+
+def _poll_ok():
+    """A tick got through: clear the error, and say so if the board saw it."""
+    global _poll_logged
+    POLL["last_error"] = None
+    if _poll_logged is None:
+        return
+    try:
+        with store.transaction(PDIR) as st:
+            store.log(st, "PR poll recovered")
+        _poll_logged = None
+    except Exception:                                       # noqa: BLE001
+        pass
 
 
 def poll_prs(interval):
@@ -239,20 +310,26 @@ def poll_prs(interval):
     a PR the human was invited to reopen, so the eventual merge is never seen.
     """
     if not shutil.which("gh"):
+        POLL["off_reason"] = "gh not found"
         print("gh not found — PR merge polling disabled", flush=True)
         return
     print("polling PR state every %ds" % interval, flush=True)
 
     while True:
         time.sleep(interval)
+        # At the top, not the bottom: a tick stuck on the lock or on `gh`
+        # should read as stale, and every `continue` below still counts.
+        POLL["last_tick"] = store.now()
         try:
             st = store.read(PDIR)
-        except Exception:
+        except Exception as e:                              # noqa: BLE001
+            _poll_failed("reading the board", e)
             continue
 
         watch = [(t["id"], t["pr_url"], t.get("pr_state")) for t in st.get("tasks", [])
                  if t.get("phase") == "pr-open" and t.get("pr_url")]
         if not watch:
+            _poll_ok()
             continue
 
         # Every network call happens outside the lock. Holding flock across a
@@ -290,47 +367,58 @@ def poll_prs(interval):
                 continue  # transient network/auth trouble; try again next tick
 
         if not found:
+            _poll_ok()
             continue
 
+        # Guarded, because this thread is the only thing watching PRs: an
+        # exception here used to end it silently, and the board kept looking
+        # healthy while nothing was ever checked again. A failed transaction
+        # writes nothing, so `pr_state` is untouched and the next tick retries
+        # the same transition by itself.
         handoffs = []
-        with store.transaction(PDIR) as st2:
-            for tid, state in found.items():
-                t = store.find(st2, tid)
-                if not t or t["phase"] != "pr-open":
-                    continue  # something moved it while we were off doing IO
-                if state == "MERGED":
-                    t["pr_state"] = "merged"
-                    store.set_phase(st2, tid, "merged", "PR merged; awaiting cleanup")
-                    handoffs.append(notify.pending(st2, tid))
-                    continue
-                # Re-read under the lock, not against the pre-`gh` snapshot:
-                # a human or an `orch set` may have moved `pr_state` during the
-                # round-trip, and acting on the stale copy is how the duplicate
-                # card comes back under a race.
-                if (t.get("pr_state") or "").upper() == state:
-                    continue          # already reacted to this state
-                if state == "CLOSED":
-                    t["pr_state"] = "closed"
-                    store.add_approval(
-                        st2, tid, "question", "PR closed without merging",
-                        "%s was closed but never merged. Decide whether to reopen it, "
-                        "or what should happen to the branch and worktree." % t.get("pr_url"))
-                else:
-                    # Recording the open state is what keeps `pr_state` honest,
-                    # so a PR closed a second time is a new decision and cards
-                    # again. No card and no wake-up either way.
-                    #
-                    # Only a close -> open move is a reopen worth logging. The
-                    # branch is also reached with nothing to say: `pr_state`
-                    # starts null and `orch set --pr-url` alone leaves it that
-                    # way, and a task back on `pr-open` after a merge arrives
-                    # here carrying "merged". Logging those as a reopen writes
-                    # an event that never happened into the one record a human
-                    # reads to reconstruct what became of a PR.
-                    was = (t.get("pr_state") or "").upper()
-                    t["pr_state"] = "open"
-                    if was == "CLOSED":
-                        store.log(st2, "%s PR reopened" % t["key"])
+        try:
+            with store.transaction(PDIR) as st2:
+                for tid, state in found.items():
+                    t = store.find(st2, tid)
+                    if not t or t["phase"] != "pr-open":
+                        continue  # something moved it while we were off doing IO
+                    if state == "MERGED":
+                        t["pr_state"] = "merged"
+                        store.set_phase(st2, tid, "merged", "PR merged; awaiting cleanup")
+                        handoffs.append(notify.pending(st2, tid))
+                        continue
+                    # Re-read under the lock, not against the pre-`gh` snapshot:
+                    # a human or an `orch set` may have moved `pr_state` during the
+                    # round-trip, and acting on the stale copy is how the duplicate
+                    # card comes back under a race.
+                    if (t.get("pr_state") or "").upper() == state:
+                        continue          # already reacted to this state
+                    if state == "CLOSED":
+                        t["pr_state"] = "closed"
+                        store.add_approval(
+                            st2, tid, "question", "PR closed without merging",
+                            "%s was closed but never merged. Decide whether to reopen it, "
+                            "or what should happen to the branch and worktree." % t.get("pr_url"))
+                    else:
+                        # Recording the open state is what keeps `pr_state` honest,
+                        # so a PR closed a second time is a new decision and cards
+                        # again. No card and no wake-up either way.
+                        #
+                        # Only a close -> open move is a reopen worth logging. The
+                        # branch is also reached with nothing to say: `pr_state`
+                        # starts null and `orch set --pr-url` alone leaves it that
+                        # way, and a task back on `pr-open` after a merge arrives
+                        # here carrying "merged". Logging those as a reopen writes
+                        # an event that never happened into the one record a human
+                        # reads to reconstruct what became of a PR.
+                        was = (t.get("pr_state") or "").upper()
+                        t["pr_state"] = "open"
+                        if was == "CLOSED":
+                            store.log(st2, "%s PR reopened" % t["key"])
+        except Exception as e:                              # noqa: BLE001
+            _poll_failed("applying PR state", e)
+            continue
+        _poll_ok()
         for h in handoffs:
             _wake_later(h)
 
@@ -374,8 +462,15 @@ def main():
 
     # Bind loopback only. This exposes local repo state and drives real agents;
     # it has no auth and must not be reachable from the network.
+    global POLL_THREAD
+    POLL["interval"] = args.poll_seconds
     if args.poll_seconds > 0:
-        threading.Thread(target=poll_prs, args=(args.poll_seconds,), daemon=True).start()
+        POLL["enabled"] = True
+        POLL_THREAD = threading.Thread(target=poll_prs, args=(args.poll_seconds,),
+                                       daemon=True)
+        POLL_THREAD.start()
+    else:
+        POLL["off_reason"] = "--poll-seconds 0"
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print("orchestrator board: http://127.0.0.1:%d" % args.port, flush=True)

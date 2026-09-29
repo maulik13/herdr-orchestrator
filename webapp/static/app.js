@@ -386,6 +386,47 @@ function syncProjectPickers() {
     b.onclick = () => api('/api/project/remove', { name: b.dataset.rm }));
 }
 
+// The PR poller's heartbeat. A dead or wedged poll thread used to be invisible
+// here — the board kept serving and looked healthy while no PR was checked —
+// so anything but a recent clean tick is shown as a warning, not left dim.
+function ago(iso) {
+  const s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
+  return s < 90 ? `${s}s ago` : `${Math.round(s / 60)}m ago`;
+}
+
+function renderPoll() {
+  const el = $('#poll');
+  const p = state._poll || {};
+  let text, cls = '', title = '';
+  if (p.off_reason || !p.enabled) {
+    text = 'PR polling off';
+    cls = 'off';
+    title = p.off_reason || '';
+  } else if (!p.alive) {
+    text = 'PR polling stopped';
+    cls = 'stale';
+    title = 'the poll thread has exited — restart the webapp; see its terminal for why';
+  } else if (p.last_error) {
+    text = `PR poll failing (${ago(p.last_error.at)})`;
+    cls = 'stale';
+    title = p.last_error.error;
+  } else if (!p.last_tick) {
+    text = 'PRs: first check pending';
+  } else {
+    // A slow tick is normal (each `gh` call may take up to 20s), so staleness
+    // is three missed intervals plus a minute of slack, not one.
+    const age = (Date.now() - Date.parse(p.last_tick)) / 1000;
+    text = `PRs checked ${ago(p.last_tick)}`;
+    if (age > 3 * p.interval + 60) {
+      cls = 'stale';
+      title = `no poll tick for ${Math.round(age)}s at a ${p.interval}s interval`;
+    }
+  }
+  el.textContent = text;
+  el.title = title;
+  el.className = `pill ${cls}`.trim();
+}
+
 function render() {
   syncProjectPickers();
   $('#updated').textContent = state.updated ? `updated ${state.updated.slice(11, 16)}` : '';
@@ -394,6 +435,7 @@ function render() {
   wip.textContent = `${state._active} / ${max} active`;
   wip.classList.toggle('full', state._active >= max);
   if (document.activeElement !== $('#max')) $('#max').value = max;
+  renderPoll();
 
   renderApprovals();
   renderSuggestions();

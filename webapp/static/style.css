@@ -95,7 +95,8 @@ h2 { font-size: 12px; letter-spacing: .06em; color: var(--dim); margin: 0 0 10px
   border: 1px solid var(--line); border-radius: var(--radius); font: inherit; }
 .pill { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
   padding: 2px 10px; font-size: 12px; }
-.pill.full { border-color: var(--warn); color: var(--warn); }
+.pill.full, .pill.stale { border-color: var(--warn); color: var(--warn); }
+.pill.off { color: var(--dim); }
 
 #approvals-wrap { margin-bottom: 26px; }
 .approval { background: var(--warn-bg); border: 1px solid var(--warn); border-radius: var(--radius);
