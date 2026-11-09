@@ -41,17 +41,21 @@ function save(key, value) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
 }
 
-// `herdr agent list` output, tolerant of shape: the CLI's JSON envelope has
-// changed between releases, and a status we cannot read is better shown as
-// nothing than as a wrong word.
+// `herdr agent list` (herdr 0.9.x): {result: {agents: [{name, agent_status, ...}]}}.
+// `name` is the herdr agent name (the board's `worker`) and is null for agents
+// nobody named; `agent` is the agent KIND ("claude"), never a name.
+//
+// Returns null for a shape it doesn't recognise. That matters: an empty map
+// means "herdr answered and none of these workers are alive", which the cards
+// show as `gone`. Misreading the output must show nothing, never `gone`.
 function agentMap(j) {
-  const list = j?.result?.agents ?? j?.agents ?? j?.result ?? j;
+  const list = j?.result?.agents;
+  if (!Array.isArray(list)) return null;
   const map = new Map();
-  if (!Array.isArray(list)) return map;
   for (const a of list) {
-    const name = a?.name ?? a?.agent;
-    const status = a?.status ?? a?.state;
-    if (name && status) map.set(String(name), String(status));
+    const status = a?.agent_status ?? a?.status;
+    if (a && !("name" in a) && status === undefined) return null; // not the shape we know
+    if (a?.name && status) map.set(String(a.name), String(status));
   }
   return map;
 }
@@ -218,8 +222,9 @@ export default class OrchBoard extends View {
     catch (e) { r = { code: 1, stdout: "", stderr: String(e) }; }
     let j = null;
     try { j = JSON.parse(r.stdout || r.stderr); } catch {}
-    const err = j?.error?.message ?? (r.code !== 0 ? (r.stderr || r.stdout || "herdr agent list failed") : null);
-    const next = err ? null : agentMap(j);
+    let err = j?.error?.message ?? (r.code !== 0 ? (r.stderr || r.stdout || "herdr agent list failed") : null);
+    let next = err ? null : agentMap(j);
+    if (!err && !next) err = "herdr agent list answered in a shape this pane doesn't know";
     const nextErr = err ? firstLine(err) : null;
     const same = nextErr === this.herdrError && JSON.stringify([...(next ?? [])]) === JSON.stringify([...(this.herdr ?? [])]);
     this.herdr = next;
