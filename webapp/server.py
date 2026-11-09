@@ -511,12 +511,33 @@ def main():
     p.add_argument("--port", type=int, default=8787)
     p.add_argument("--poll-seconds", type=int, default=60,
                    help="how often to check PR state via gh; 0 disables")
+    p.add_argument("--headless", action="store_true",
+                   help="run only the PR poller, in the foreground, with no web board "
+                        "(what `orch poll` runs)")
     args = p.parse_args()
 
     global HAVE_PLANNOTATOR
     PDIR = store.board_dir()
     os.makedirs(PDIR, exist_ok=True)
     HAVE_PLANNOTATOR = bool(shutil.which("plannotator"))
+
+    # The same loop the web board runs, minus the board. Running both at once is
+    # safe — every reaction is re-checked under the board lock, so a transition
+    # is acted on once — but it asks GitHub twice as often for nothing.
+    if args.headless:
+        if args.poll_seconds <= 0:
+            sys.exit("--headless needs --poll-seconds above 0: polling is all it does")
+        print("orch poll: code %s" % loaded_commit(), flush=True)
+        print("state: %s" % os.path.join(PDIR, "state.json"), flush=True)
+        POLL["interval"] = args.poll_seconds
+        POLL["enabled"] = True
+        try:
+            poll_prs(args.poll_seconds)
+        except KeyboardInterrupt:
+            print("\nstopped")
+            return
+        # poll_prs only returns when it cannot poll at all; say so with the exit code.
+        sys.exit("orch poll: %s" % (POLL["off_reason"] or "poller stopped"))
 
     # Bind loopback only. This exposes local repo state and drives real agents;
     # it has no auth and must not be reachable from the network.

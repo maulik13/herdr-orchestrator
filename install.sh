@@ -106,6 +106,14 @@ case "${1:-install}" in
     else
       warn "$BINLINK exists and is not a symlink — leaving it; put $REPO/bin on PATH yourself"
     fi
+    # The board pane for the Herdr app. A real copy, not a symlink: Herdr App
+    # doesn't load a mod's files through one.
+    HERDR_APP="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
+    if [ -d "$HERDR_APP" ]; then
+      mkdir -p "$HERDR_APP/mods/orch-board"
+      cp "$REPO/herdr/mods/orch-board/"* "$HERDR_APP/mods/orch-board/"
+      ok "copied board pane to $HERDR_APP/mods/orch-board (open: herdr-app do pane.split --direction right --mod orch-board)"
+    fi
     echo
     check
     echo

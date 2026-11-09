@@ -312,13 +312,15 @@ when no other agent is active.
 
 ## Cleanup after merge
 
-You do not have to watch for merges. When the board webapp is running it polls
-`gh` for every task in `pr-open` and moves merged ones to `merged` on its own —
-so `orch list --phase merged` is your work queue here. If a PR is *closed*
-without merging it raises a `question` card instead and leaves the task alone,
-because that needs a human decision, not cleanup.
+You do not have to watch for merges. When the board webapp or `orch poll` is
+running, it polls `gh` for every task in `pr-open` and moves merged ones to
+`merged` on its own — so `orch list --phase merged` is your work queue here.
+`orch poll` is the same poller without the web board; the Herdr app's board
+pane starts it as a background terminal. If a PR is *closed* without merging it
+raises a `question` card instead and leaves the task alone, because that needs
+a human decision, not cleanup.
 
-When the webapp is not running nothing advances a merged PR, so check
+When neither is running nothing advances a merged PR, so check
 `orch cleanup-check` on `pr-open` tasks yourself.
 
 Either way, clean up only after the guards pass:
