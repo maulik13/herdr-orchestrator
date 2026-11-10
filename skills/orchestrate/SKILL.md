@@ -241,7 +241,8 @@ orch approve-request GH-412 --kind conflict --title "<the disagreement in one li
 orch phase GH-412 awaiting-decision
 ```
 
-Plan approvals carry the worker's `PLAN.md` path, and the board offers a
+Plan approvals carry the path of the worker's plan, which `orch` stores under
+`$HERDR_ORCHESTRATOR_HOME/plans/<KEY>.md` (never in the worktree), and the board offers a
 **Review in Plannotator** button that opens it for inline annotation. The
 verdict settles the approval by itself: approved lands as approved, and
 annotated lands as a rejection whose note is the reviewer's feedback verbatim.

@@ -84,7 +84,7 @@ While it runs it polls `gh` every 60s (`--poll-seconds`, `0` disables) for tasks
 
 ### 4. Review plans in Plannotator (optional)
 
-A worker writes its plan to `PLAN.md` in its worktree and attaches the path to the approval. The card then offers **Review in Plannotator**, which opens the plan in [Plannotator](https://github.com/backnotprop/plannotator) for inline annotation instead of a bare approve/reject.
+A worker submits its plan with `orch approve-request --plan -`, which stores it in `~/.claude/orchestrator/plans/<KEY>.md` (outside the worktree, so it never blocks cleanup and outlives the task) and attaches that path to the approval. The card then offers **Review in Plannotator**, which opens the plan in [Plannotator](https://github.com/backnotprop/plannotator) for inline annotation instead of a bare approve/reject.
 
 | Plannotator | Board |
 |---|---|

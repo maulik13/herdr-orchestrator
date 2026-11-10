@@ -141,6 +141,29 @@ def orch_home():
     )
 
 
+def plans_dir():
+    """Where submitted plans live. Outside every worktree on purpose: a plan
+    file left in the worktree is untracked, which fails `cleanup-check` and
+    blocks `worktree remove`, and it would be deleted with the worktree."""
+    return os.path.join(orch_home(), "plans")
+
+
+def save_plan(key, text):
+    """Write a plan for task KEY atomically and return its absolute path.
+
+    One file per task: a resubmitted plan replaces the last, so the board
+    always opens the version under review."""
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", key).lstrip(".") or "plan"
+    d = plans_dir()
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, name + ".md")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text if text.endswith("\n") else text + "\n")
+    os.replace(tmp, path)
+    return path
+
+
 def repo_root(cwd=None):
     """Main repo root, resolved so it is stable from inside a linked worktree."""
     cwd = cwd or os.getcwd()

@@ -96,13 +96,19 @@ WORK IN THIS ORDER:
    reading several of these, so lead with what they'd want to argue with:
 
      orch approve-request <KEY> --kind plan --title "<one-line approach>" \
-       --plan-path PLAN.md --body "<the same one-liner, for the card>"
+       --body "<the same one-liner, for the card>" --plan - <<'PLAN'
+     ## Approach
+     ...
+     PLAN
 
-   Write PLAN.md in your worktree root: the approach in 3-5 bullets, key
-   tradeoffs, risks, and what you are deliberately not doing. Keep it under
-   ~20 lines.
+   The plan goes in on stdin: the approach in 3-5 bullets, key tradeoffs,
+   risks, and what you are deliberately not doing. Keep it under ~20 lines.
+   `orch` stores it outside your worktree. Do not write a PLAN.md (or any
+   other scratch file) into the worktree: an untracked file there blocks
+   cleanup after the PR merges. To revise a rejected plan, submit again the
+   same way; it replaces the previous one.
 
-   `--plan-path` matters. The human opens that file in Plannotator and
+   `--plan` matters. The human opens the stored plan in Plannotator and
    annotates it inline, so write it as a document to be marked up — short
    sections with headings, one idea per bullet — not as a wall of prose. Their
    annotations come back to you as the rejection note, quoting the parts they
