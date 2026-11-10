@@ -28,7 +28,7 @@ locking, schema validation and board.md regeneration happen in one place.
   orch whoami [--agent NAME] [--pane ID]    (register/print who to wake for a handoff)
   orch handoffs [--json]               (tasks waiting on the orchestrator)
   orch ack TASK                        (handoff picked up; clears it)
-  orch approve-request TASK --kind K --title T [--body B|--body-file F] [--plan-path P]
+  orch approve-request TASK --kind K --title T [--body B|--body-file F] [--plan F|-|--plan-path P]
   orch approvals [--json]
   orch resolve APPROVAL --decision approved|rejected [--note N]
   orch board                           (print board.md)
@@ -343,11 +343,28 @@ def cmd_approve_request(args):
     if args.body_file:
         with open(args.body_file) as fh:
             body = fh.read()
+    plan_text = None
+    if args.plan:
+        # Read before taking the lock: stdin may be slow, the board must not wait.
+        if args.plan == "-":
+            plan_text = sys.stdin.read()
+        else:
+            try:
+                with open(args.plan) as fh:
+                    plan_text = fh.read()
+            except OSError as e:
+                sys.exit("orch: cannot read plan %s: %s" % (args.plan, e.strerror))
+        if not plan_text.strip():
+            sys.exit("orch: the plan is empty")
     pdir = pdir_for(args)
     with store.transaction(pdir) as st:
         plan = os.path.abspath(args.plan_path) if args.plan_path else None
         if plan and not os.path.isfile(plan):
             sys.exit("orch: no such plan file: %s" % plan)
+        t = store.find(st, args.task)
+        if plan_text is not None and t:
+            # Saved only for a real task, so a typo'd key leaves no stray file.
+            plan = store.save_plan(t["key"], plan_text)
         a = store.add_approval(st, args.task, args.kind, args.title, body, plan)
     print(json.dumps({"id": a["id"], "kind": a["kind"]}))
 
@@ -593,8 +610,12 @@ def main():
     a.add_argument("task"); a.add_argument("--kind", required=True, choices=store.APPROVAL_KINDS)
     a.add_argument("--title", required=True); a.add_argument("--body")
     a.add_argument("--body-file", dest="body_file")
-    a.add_argument("--plan-path", dest="plan_path",
-                   help="markdown/HTML file to open in Plannotator for review")
+    g = a.add_mutually_exclusive_group()
+    g.add_argument("--plan", metavar="FILE|-",
+                   help="plan markdown ('-' for stdin); orch stores it under "
+                        "$HERDR_ORCHESTRATOR_HOME/plans/, keeping the worktree clean")
+    g.add_argument("--plan-path", dest="plan_path",
+                   help="existing markdown/HTML file to open in Plannotator, used in place")
 
     a = sub.add_parser("approvals"); a.set_defaults(fn=cmd_approvals)
     a.add_argument("--json", action="store_true")

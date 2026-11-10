@@ -248,8 +248,9 @@ process only.
 
 ### The Plannotator gate
 
-A worker writes its plan to `PLAN.md` in its worktree and attaches the path to
-the approval, which is what makes the **Review in Plannotator** button appear.
+A worker submits its plan with `orch approve-request --plan -`. `orch` stores it
+at `plans/<KEY>.md` under the orchestrator home, not in the worktree, where an
+untracked file would fail `cleanup-check`, and attaches that path to the approval, which is what makes the **Review in Plannotator** button appear.
 
 `/api/plan/review` marks `review_started` and hands off to a thread, because
 Plannotator blocks until a human decides — up to a 4h timeout. The verdict is
