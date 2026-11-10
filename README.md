@@ -64,6 +64,16 @@ It normalizes each item, queues them, shows a plan, and waits for one confirmati
 
 ### 3. Open the board
 
+**In the Herdr app**, as a pane beside the orchestrator (`install.sh` copies it into `~/.config/herdr-app/mods/orch-board`):
+
+```bash
+herdr-app do pane.split --direction right --mod orch-board
+```
+
+It reads `state.json` and redraws when the board changes. You can approve or reject cards there (it runs `orch resolve`), see each worker's status from `herdr agent list`, and get a Herdr notification when a new card arrives. The **PR poller** pill in its header starts `orch poll` as a background Herdr terminal. That's the web board's merge watcher without the web board, and it keeps running when the Herdr window closes. The pane can't do Plannotator reviews, queue reordering or project management, so those stay in the web board.
+
+**In a browser:**
+
 ```bash
 python3 webapp/server.py
 ```

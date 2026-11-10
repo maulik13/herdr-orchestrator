@@ -32,6 +32,7 @@ locking, schema validation and board.md regeneration happen in one place.
   orch approvals [--json]
   orch resolve APPROVAL --decision approved|rejected [--note N]
   orch board                           (print board.md)
+  orch poll [--seconds N]              (PR merge poller without the web board; runs until stopped)
   orch cleanup-check TASK              (is it safe to archive this worktree?)
 """
 import argparse
@@ -468,6 +469,16 @@ def cmd_board(args):
         sys.stdout.write(fh.read())
 
 
+def cmd_poll(args):
+    """The webapp's PR poller on its own. One implementation, in the server, so
+    the poll tests cover both ways of running it."""
+    if args.seconds <= 0:
+        sys.exit("orch: --seconds must be above 0")
+    server = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "webapp", "server.py")
+    os.execv(sys.executable, [sys.executable, os.path.realpath(server),
+                              "--headless", "--poll-seconds", str(args.seconds)])
+
+
 def cmd_cleanup_check(args):
     """Three guards before archiving a worktree. Any failure means ask the human."""
     st = store.read(pdir_for(args))
@@ -626,6 +637,11 @@ def main():
     a.add_argument("--note")
 
     sub.add_parser("board").set_defaults(fn=cmd_board)
+
+    a = sub.add_parser("poll", description="Watch pr-open tasks via gh and move merged ones "
+                       "on, without the web board. Runs until stopped.")
+    a.set_defaults(fn=cmd_poll)
+    a.add_argument("--seconds", type=int, default=60, help="how often to ask gh (default 60)")
 
     a = sub.add_parser("cleanup-check"); a.set_defaults(fn=cmd_cleanup_check)
     a.add_argument("task")
