@@ -110,9 +110,11 @@ case "${1:-install}" in
     # doesn't load a mod's files through one.
     HERDR_APP="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
     if [ -d "$HERDR_APP" ]; then
-      mkdir -p "$HERDR_APP/mods/orch-board"
-      cp "$REPO/herdr/mods/orch-board/"* "$HERDR_APP/mods/orch-board/"
-      ok "copied board pane to $HERDR_APP/mods/orch-board (open: herdr-app do pane.split --direction right --mod orch-board)"
+      for m in orch-board orch-toggle; do
+        mkdir -p "$HERDR_APP/mods/$m"
+        cp "$REPO/herdr/mods/$m/"* "$HERDR_APP/mods/$m/"
+      done
+      ok "copied board pane and status-bar toggle to $HERDR_APP/mods/ (open: herdr-app do pane.split --direction right --mod orch-board)"
     fi
     echo
     check
