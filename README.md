@@ -72,6 +72,18 @@ herdr-app do pane.split --direction right --mod orch-board
 
 It reads `state.json` and redraws when the board changes. You can approve or reject cards there (it runs `orch resolve`), see each worker's status from `herdr agent list`, and get a Herdr notification when a new card arrives. The **PR poller** pill in its header starts `orch poll` as a background Herdr terminal. That's the web board's merge watcher without the web board, and it keeps running when the Herdr window closes. The pane can't do Plannotator reviews, queue reordering or project management, so those stay in the web board.
 
+To keep the board one click away, make it a hidden node in your own layout and add the **orch-toggle** status-bar button beside `workspace-status`. The button shows and hides the node, lights up while the board is open, shows a count when cards are waiting on you, and displays whatever key you bind to `layout.toggle:board`:
+
+```json
+{ "id": "board", "type": "block", "content": { "mod": "orch-board" },
+  "size": { "px": 440 }, "min": 320, "max": 900, "hidden": true }
+
+{ "id": "status-row", "type": "row", "size": { "px": 28 }, "resizable": false, "children": [
+  { "id": "status", "type": "block", "size": { "weight": 1 }, "content": { "mod": "workspace-status" } },
+  { "id": "orch-toggle", "type": "block", "size": { "px": 190 },
+    "content": { "mod": "orch-toggle", "props": { "target": "board" } } } ] }
+```
+
 **In a browser:**
 
 ```bash
